@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bobble Ball</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#111; }
+  #c { display:block; width:100vw; height:100vh; }
+  #info {
+    position:fixed; top:10px; left:10px; color:#fff; font-family:Arial, sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.5); padding:8px 12px; border-radius:6px;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info">Drag = rotate &nbsp;|&nbsp; Scroll = zoom &nbsp;|&nbsp; Right-drag = pan</div>
+
+<div id="nameCardPitcher" class="name-card"></div>
+<div id="nameCardBatter" class="name-card"></div>
+
+<div id="homerunOverlay" class="homerun-overlay">
+  <div id="homerunText" class="homerun-text">HOMERUN!</div>
+  <div id="confettiLayer" class="confetti-layer"></div>
+</div>
+
+<div id="pitchCallText" class="pitch-call-text">Strike!</div>
+
+<style>
+  .pitch-call-text {
+    position: fixed;
+    top: 32%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: Arial, sans-serif;
+    font-weight: 900;
+    font-size: 54px;
+    color: #ffd700;
+    -webkit-text-stroke: 3px #000;
+    text-stroke: 3px #000;
+    text-shadow: 0 0 14px rgba(0,0,0,0.7);
+    opacity: 0;
+    pointer-events: none;
+    z-index: 90;
+    white-space: nowrap;
+  }
+  .pitch-call-text.show {
+    animation: pitchCallFade 0.75s ease-out forwards;
+  }
+  @keyframes pitchCallFade {
+    0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.85); }
+    15%  { opacity: 1; transform: translate(-50%, -50%) scale(1.05); }
+    70%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
+  }
+</style>
+
+<style>
+  .homerun-overlay {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    display: none;
+    z-index: 100;
+    overflow: hidden;
+  }
+  .homerun-text {
+    position: absolute;
+    top: 38%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.6);
+    font-family: Arial, sans-serif;
+    font-weight: 900;
+    font-size: 60px;
+    color: #ffd700;
+    -webkit-text-stroke: 4px #000;
+    text-stroke: 4px #000;
+    text-shadow: 0 0 18px rgba(0,0,0,0.7);
+    opacity: 0;
+    white-space: nowrap;
+  }
+  .homerun-text.playing {
+    animation: homerunGrow 3s ease-out forwards;
+  }
+  @keyframes homerunGrow {
+    0%   { transform: translate(-50%, -50%) scale(0.6); opacity: 0; }
+    10%  { opacity: 1; }
+    85%  { transform: translate(-50%, -50%) scale(2.2); opacity: 1; }
+    100% { transform: translate(-50%, -50%) scale(2.4); opacity: 0; }
+  }
+  .confetti-piece {
+    position: absolute;
+    top: -20px;
+    width: 10px;
+    height: 16px;
+    opacity: 0.95;
+    animation: confettiFall linear forwards;
+  }
+  @keyframes confettiFall {
+    0%   { transform: translateY(0) rotate(0deg); }
+    100% { transform: translateY(110vh) rotate(720deg); }
+  }
+</style>
+
+<style>
+  .name-card {
+    position: fixed;
+    transform: translate(-50%, -100%);
+    background: rgba(0, 0, 0, 0.25); /* black, 75% transparent */
+    color: #fff;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-family: Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    text-align: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+    white-space: nowrap;
+  }
+  .name-card .name-card-title {
+    font-weight: bold;
+    font-size: 14px;
+    margin-bottom: 2px;
+  }
+</style>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+
+/* ============================================================
+   STEP 1: Just the field.
+   - 200ft x 200ft playing surface
+   - Bases set 60ft apart (standard square diamond)
+   - No stripes yet, just plain grass + dirt diamond + bases
+   ============================================================ */
+
+// Scale: 1 foot = 0.3 world units (keeps numbers manageable)
+const FT = 0.3;
+const FIELD_SIZE = 350 * FT;     // 350ft x 350ft (expanded by 150ft)
+const BASE_DIST = 60 * FT;       // 60ft between bases
+
+// Diamond corner points (home at origin, going counter-clockwise:
+// home -> first -> second -> third -> home)
+const HOME   = new THREE.Vector3(0, 0, 0);
+const FIRST  = new THREE.Vector3(-BASE_DIST, 0, BASE_DIST);
+const SECOND = new THREE.Vector3(0, 0, BASE_DIST * 2);
+const THIRD  = new THREE.Vector3(BASE_DIST, 0, BASE_DIST);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87b8d8);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(0, FIELD_SIZE * 0.7, -FIELD_SIZE * 0.8);
+camera.lookAt(0, 0, BASE_DIST);
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Camera is fully scripted for gameplay (batting view -> ball-follow view),
+// so no manual orbit controls here anymore.
+
+// ---------- Lighting ----------
+const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x3a4d2a, 0.9);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff4d6, 1.3);
+sun.position.set(FIELD_SIZE * 0.4, FIELD_SIZE * 0.6, -FIELD_SIZE * 0.3);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -FIELD_SIZE;
+sun.shadow.camera.right = FIELD_SIZE;
+sun.shadow.camera.top = FIELD_SIZE;
+sun.shadow.camera.bottom = -FIELD_SIZE;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = FIELD_SIZE * 4;
+scene.add(sun);
+
+// ---------- Ground (200ft x 200ft grass) ----------
+const groundGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x4c8a3a, roughness: 1 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+// Center the field so home plate sits near the front edge, field extends toward outfield
+ground.position.set(0, 0, FIELD_SIZE / 2 - BASE_DIST * 0.3);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// (dirt infield removed per request — grass only)
+
+// ---------- Bases ----------
+function makeBase(pos, isHome = false, rotationY = 0) {
+  if (isHome) {
+    // Regulation home plate: 17" wide square-ish back edge tapering to a point,
+    // modeled as a five-sided pentagon shape (flat, sitting on the ground).
+    const w = 1.4;   // width of the back edge (left-right)
+    const d = 1.4;   // total depth (back edge to the point)
+    const shape = new THREE.Shape();
+    shape.moveTo(-w / 2, 0);              // back-left corner
+    shape.lineTo(w / 2, 0);                // back-right corner
+    shape.lineTo(w / 2, -d * 0.5);         // right side corner (where it angles in)
+    shape.lineTo(0, -d);                   // point, facing the pitcher
+    shape.lineTo(-w / 2, -d * 0.5);        // left side corner
+    shape.lineTo(-w / 2, 0);
+
+    const geo = new THREE.ShapeGeometry(shape);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.rotation.z = Math.PI; // point of the plate faces the backstop, flat edge faces the pitcher
+    mesh.position.set(pos.x, 0.05, pos.z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    return mesh;
+  }
+
+  const size = 1.3;
+  const geo = new THREE.BoxGeometry(size, 0.15, size);
+  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(pos.x, 0.1, pos.z);
+  mesh.rotation.y = rotationY;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+// ---------- Dirt batting/home plate area ----------
+const homeDirtRadius = 7;
+const homeDirt = new THREE.Mesh(
+  new THREE.CircleGeometry(homeDirtRadius, 32),
+  new THREE.MeshStandardMaterial({ color: 0xb5793c, roughness: 1 })
+);
+homeDirt.rotation.x = -Math.PI / 2;
+homeDirt.position.set(HOME.x, 0.015, HOME.z);
+homeDirt.receiveShadow = true;
+scene.add(homeDirt);
+
+makeBase(HOME, true);
+makeBase(FIRST, false, Math.PI / 4);
+makeBase(SECOND, false, Math.PI / 4);
+makeBase(THIRD, false, Math.PI / 4);
+
+// ---------- Pitcher's mound (dirt circle at the center of the diamond) ----------
+const moundCenter = new THREE.Vector3(
+  (HOME.x + FIRST.x + SECOND.x + THIRD.x) / 4,
+  0,
+  (HOME.z + FIRST.z + SECOND.z + THIRD.z) / 4
+);
+const moundRadius = 2.7;
+const mound = new THREE.Mesh(
+  new THREE.CylinderGeometry(moundRadius, moundRadius * 1.15, 0.4, 32),
+  new THREE.MeshStandardMaterial({ color: 0xa56a35, roughness: 1 })
+);
+mound.position.set(moundCenter.x, 0.2, moundCenter.z);
+mound.castShadow = true;
+mound.receiveShadow = true;
+scene.add(mound);
+
+// Small pitcher's rubber on top of the mound
+const rubber = new THREE.Mesh(
+  new THREE.BoxGeometry(0.6, 0.08, 1.6),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 })
+);
+rubber.position.set(moundCenter.x, 0.42, moundCenter.z);
+rubber.rotation.y = Math.PI / 2;
+rubber.castShadow = true;
+scene.add(rubber);
+
+// (base labels removed per request)
+
+// ---------- Batter's boxes (chalk outlines, both sides of home plate) ----------
+function makeBatterBox(xSign) {
+  const boxWidth = 1.2;   // ~4ft
+  const boxLength = 1.8;  // ~6ft
+  const gap = 0.85;       // gap from plate center to inner edge of box
+  const geo = new THREE.PlaneGeometry(boxWidth, boxLength);
+  const edges = new THREE.EdgesGeometry(geo);
+  const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff }));
+  line.rotation.x = -Math.PI / 2;
+  // Centered to the side of the plate, straddling home plate front-to-back
+  line.position.set(HOME.x + xSign * (gap + boxWidth / 2), 0.05, HOME.z - boxLength * 0.15);
+  scene.add(line);
+}
+makeBatterBox(1);   // right-handed batter's box
+makeBatterBox(-1);  // left-handed batter's box
+
+// ---------- Foul lines (chalk, home through 1B and 3B out to the field edge) ----------
+function makeFoulLine(throughBase, cornerSign) {
+  // Home plate's point (the back tip, facing the backstop) is where the foul
+  // lines actually originate — not the flat front edge.
+  const plateDepth = 1.4;
+  const tip = new THREE.Vector3(HOME.x, 0, HOME.z - plateDepth);
+
+  const dir = new THREE.Vector3().subVectors(throughBase, tip).normalize();
+  const length = FIELD_SIZE * 1.15; // run from the plate's tip past the base to the field edge
+  const geo = new THREE.BoxGeometry(0.15, 0.04, length);
+  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
+  const mesh = new THREE.Mesh(geo, mat);
+
+  // Default box length axis is local +Z. Rotate it to point along `dir`.
+  const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+  mesh.quaternion.copy(quat);
+
+  mesh.position.copy(tip).addScaledVector(dir, length / 2);
+  mesh.position.y = 0.03;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+// FIRST sits on the negative-x side, THIRD on the positive-x side.
+makeFoulLine(FIRST, -1);
+makeFoulLine(THIRD, 1);
+
+// ---------- Dirt circles around 1B, 2B, and 3B (same size as the pitcher's mound) ----------
+function makeBaseDirtCircle(basePos) {
+  const circle = new THREE.Mesh(
+    new THREE.CircleGeometry(moundRadius, 32),
+    new THREE.MeshStandardMaterial({ color: 0xa56a35, roughness: 1 })
+  );
+  circle.rotation.x = -Math.PI / 2;
+  circle.position.set(basePos.x, 0.012, basePos.z);
+  circle.receiveShadow = true;
+  scene.add(circle);
+}
+makeBaseDirtCircle(FIRST);
+makeBaseDirtCircle(SECOND);
+makeBaseDirtCircle(THIRD);
+
+// Collision data for all outfield fence segments (filled in below)
+const fenceSegments = [];
+
+// ---------- Outfield wooden fence (down the 3B line, 250ft out, running 175ft) ----------
+{
+  const fenceHeight = 8 * FT;
+  const fenceThickness = 0.5 * FT;
+  const startDist = 200 * FT;   // distance from home plate, along the 3B foul line
+  const runLength = 175 * FT;   // how far the fence extends from that point
+
+  const dir3B = new THREE.Vector3().subVectors(THIRD, HOME).normalize();
+  const fenceStart = new THREE.Vector3().copy(HOME).addScaledVector(dir3B, startDist);
+
+  // Fence runs perpendicular to the 3B line, sweeping toward center field.
+  const fenceDir = new THREE.Vector3(-dir3B.z, 0, dir3B.x); // 90° rotation of dir3B (toward center)
+
+  const fenceMat = new THREE.MeshStandardMaterial({ color: 0x8a5a34, roughness: 0.95 });
+  const postMat = new THREE.MeshStandardMaterial({ color: 0x6b4226, roughness: 0.95 });
+
+  // Main fence panel (continuous wood wall)
+  const panelGeo = new THREE.BoxGeometry(fenceThickness, fenceHeight, runLength);
+  const panel = new THREE.Mesh(panelGeo, fenceMat);
+  const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), fenceDir);
+  panel.quaternion.copy(quat);
+  panel.position.copy(fenceStart).addScaledVector(fenceDir, runLength / 2);
+  panel.position.y = fenceHeight / 2;
+  panel.castShadow = true;
+  panel.receiveShadow = true;
+  scene.add(panel);
+  fenceSegments.push({
+    start: fenceStart.clone(),
+    end: fenceStart.clone().addScaledVector(fenceDir, runLength),
+    thickness: fenceThickness,
+    height: fenceHeight,
+  });
+
+  // Support posts every ~10ft along the run for a more fence-like look
+  const postSpacing = 10 * FT;
+  const postCount = Math.floor(runLength / postSpacing) + 1;
+  for (let i = 0; i <= postCount; i++) {
+    const t = Math.min(i * postSpacing, runLength);
+    const postPos = new THREE.Vector3().copy(fenceStart).addScaledVector(fenceDir, t);
+    const post = new THREE.Mesh(
+      new THREE.BoxGeometry(fenceThickness * 1.6, fenceHeight * 1.05, fenceThickness * 1.6),
+      postMat
+    );
+    post.position.set(postPos.x, (fenceHeight * 1.05) / 2, postPos.z);
+    post.castShadow = true;
+    post.receiveShadow = true;
+    scene.add(post);
+  }
+
+  // ---------- Second fence segment: turns 45° off the end of the first, runs 75ft ----------
+  const fence1End = new THREE.Vector3().copy(fenceStart).addScaledVector(fenceDir, runLength);
+  const run2Length = 75 * FT;
+  // Rotate fenceDir by 45° (toward center field / further around the diamond)
+  const turnAngle = Math.PI / 4;
+  const fenceDir2 = new THREE.Vector3(
+    fenceDir.x * Math.cos(turnAngle) - fenceDir.z * Math.sin(turnAngle),
+    0,
+    fenceDir.x * Math.sin(turnAngle) + fenceDir.z * Math.cos(turnAngle)
+  ).normalize();
+
+  const panel2Geo = new THREE.BoxGeometry(fenceThickness, fenceHeight, run2Length);
+  const panel2 = new THREE.Mesh(panel2Geo, fenceMat);
+  const quat2 = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), fenceDir2);
+  panel2.quaternion.copy(quat2);
+  panel2.position.copy(fence1End).addScaledVector(fenceDir2, run2Length / 2);
+  panel2.position.y = fenceHeight / 2;
+  panel2.castShadow = true;
+  panel2.receiveShadow = true;
+  scene.add(panel2);
+  fenceSegments.push({
+    start: fence1End.clone(),
+    end: fence1End.clone().addScaledVector(fenceDir2, run2Length),
+    thickness: fenceThickness,
+    height: fenceHeight,
+  });
+
+  const post2Count = Math.floor(run2Length / postSpacing) + 1;
+  for (let i = 0; i <= post2Count; i++) {
+    const t = Math.min(i * postSpacing, run2Length);
+    const postPos = new THREE.Vector3().copy(fence1End).addScaledVector(fenceDir2, t);
+    const post = new THREE.Mesh(
+      new THREE.BoxGeometry(fenceThickness * 1.6, fenceHeight * 1.05, fenceThickness * 1.6),
+      postMat
+    );
+    post.position.set(postPos.x, (fenceHeight * 1.05) / 2, postPos.z);
+    post.castShadow = true;
+    post.receiveShadow = true;
+    scene.add(post);
+  }
+
+  // ---------- Third fence segment: another 45° turn off the end of the second ----------
+  const fence2End = new THREE.Vector3().copy(fence1End).addScaledVector(fenceDir2, run2Length);
+  const fenceDir3 = new THREE.Vector3(
+    fenceDir2.x * Math.cos(turnAngle) - fenceDir2.z * Math.sin(turnAngle),
+    0,
+    fenceDir2.x * Math.sin(turnAngle) + fenceDir2.z * Math.cos(turnAngle)
+  ).normalize();
+
+  // Figure out how far this segment needs to run to cross past the 1B foul line.
+  // 1B foul line: passes through the plate's back tip, heading toward FIRST.
+  const tip = new THREE.Vector3(HOME.x, 0, HOME.z - 1.4); // matches plate depth used for foul lines
+  const dir1B = new THREE.Vector3().subVectors(FIRST, tip).normalize();
+
+  // Solve for intersection of (fence2End + t*fenceDir3) with (tip + s*dir1B) in the XZ plane.
+  function intersect2D(p1, d1, p2, d2) {
+    // p1 + t*d1 = p2 + s*d2  -> solve for t
+    const denom = d1.x * d2.z - d1.z * d2.x;
+    if (Math.abs(denom) < 1e-6) return null;
+    const diffX = p2.x - p1.x;
+    const diffZ = p2.z - p1.z;
+    const t = (diffX * d2.z - diffZ * d2.x) / denom;
+    return t;
+  }
+  const tCross = intersect2D(fence2End, fenceDir3, tip, dir1B);
+  const margin = 25 * FT; // run a bit "just past" the foul line
+  const run3Length = (tCross !== null && tCross > 0) ? tCross + margin : 75 * FT;
+
+  const panel3Geo = new THREE.BoxGeometry(fenceThickness, fenceHeight, run3Length);
+  const panel3 = new THREE.Mesh(panel3Geo, fenceMat);
+  const quat3 = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), fenceDir3);
+  panel3.quaternion.copy(quat3);
+  panel3.position.copy(fence2End).addScaledVector(fenceDir3, run3Length / 2);
+  panel3.position.y = fenceHeight / 2;
+  panel3.castShadow = true;
+  panel3.receiveShadow = true;
+  scene.add(panel3);
+  fenceSegments.push({
+    start: fence2End.clone(),
+    end: fence2End.clone().addScaledVector(fenceDir3, run3Length),
+    thickness: fenceThickness,
+    height: fenceHeight,
+  });
+
+  const post3Count = Math.floor(run3Length / postSpacing) + 1;
+  for (let i = 0; i <= post3Count; i++) {
+    const t = Math.min(i * postSpacing, run3Length);
+    const postPos = new THREE.Vector3().copy(fence2End).addScaledVector(fenceDir3, t);
+    const post = new THREE.Mesh(
+      new THREE.BoxGeometry(fenceThickness * 1.6, fenceHeight * 1.05, fenceThickness * 1.6),
+      postMat
+    );
+    post.position.set(postPos.x, (fenceHeight * 1.05) / 2, postPos.z);
+    post.castShadow = true;
+    post.receiveShadow = true;
+    scene.add(post);
+  }
+}
+
+// ---------- Player: pitcher (pill/capsule shape, white) on the mound ----------
+const PLAYER_RADIUS = 1.05 * 0.5;
+const PLAYER_HEIGHT = PLAYER_RADIUS * 2.2; // cylindrical mid-section length (capsule adds the radius caps on top)
+const pitcherMesh = new THREE.Mesh(
+  new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT, 8, 16),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.55 })
+);
+// Capsule's total height = PLAYER_HEIGHT + 2*PLAYER_RADIUS; sit it on top of the mound
+const standHeight = PLAYER_HEIGHT / 2 + PLAYER_RADIUS;
+pitcherMesh.position.set(moundCenter.x, standHeight + 0.4, moundCenter.z);
+pitcherMesh.castShadow = true;
+pitcherMesh.receiveShadow = true;
+scene.add(pitcherMesh);
+
+// ---------- Baseball (white sphere, held by the pitcher) ----------
+const BALL_RADIUS = 0.22;
+const ballMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(BALL_RADIUS, 16, 16),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 })
+);
+const CAPSULE_TOTAL_HEIGHT = PLAYER_HEIGHT + 2 * PLAYER_RADIUS;
+const ballHoldHeight = 0.4 + (2 / 3) * CAPSULE_TOTAL_HEIGHT; // two-thirds up from the bottom of the capsule
+// Positioned just off the pitcher's hand, like he's holding it
+ballMesh.position.set(
+  pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
+  ballHoldHeight,
+  pitcherMesh.position.z - PLAYER_RADIUS * 0.3
+);
+ballMesh.castShadow = true;
+scene.add(ballMesh);
+
+// ---------- Batter (capsule, red) in the left-handed batter's box, holding a bat ----------
+const batterMesh = new THREE.Mesh(
+  new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT, 8, 16),
+  new THREE.MeshStandardMaterial({ color: 0xff3b30, roughness: 0.55 })
+);
+// Left-handed batter's box center (matches makeBatterBox(-1) placement)
+const lhBoxGap = 0.85, lhBoxWidth = 1.2, lhBoxLength = 1.8;
+const batterPos = new THREE.Vector3(
+  HOME.x - (lhBoxGap + lhBoxWidth / 2),
+  standHeight,
+  HOME.z - lhBoxLength * 0.15
+);
+batterMesh.position.copy(batterPos);
+batterMesh.castShadow = true;
+batterMesh.receiveShadow = true;
+scene.add(batterMesh);
+
+// Wooden bat, held out toward home plate, pivoting from the batter's hands
+const batGroup = new THREE.Group();
+const batLength = 2.3;
+const batGeo = new THREE.CylinderGeometry(0.18, 0.07, batLength, 12); // thick(barrel) far end, thin(handle) near batter
+const batMat = new THREE.MeshStandardMaterial({ color: 0xc9a063, roughness: 0.6 });
+const batMesh = new THREE.Mesh(batGeo, batMat);
+batMesh.rotation.x = Math.PI / 2;      // lay the cylinder so it points outward
+batMesh.position.z = batLength / 2;    // offset so the handle is at the group's origin
+batMesh.castShadow = true;
+batGroup.add(batMesh);
+batGroup.position.set(batterPos.x, (2 / 3) * CAPSULE_TOTAL_HEIGHT, batterPos.z);
+// Resting angle: bat starts back behind home plate (toward the backstop),
+// swings forward through the plate, ending pointed toward first base.
+const BAT_REST_ROT = (Math.PI / 2.5) * 1.33 * 1.25;
+const BAT_SWING_ROT = -Math.PI / 2.2;
+batGroup.rotation.y = BAT_REST_ROT;
+scene.add(batGroup);
+
+// ---------- Swing mechanic: Enter swings the bat and checks for a ball collision ----------
+const swing = {
+  active: false,
+  t: 0,
+  duration: 0.25, // seconds for a full swing
+};
+const HIT_RADIUS = 1.6; // how close the ball needs to be to the bat's sweet spot to count as a hit
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Enter') {
+    e.preventDefault();
+    if (!swing.active) {
+      swing.active = true;
+      swing.t = 0;
+      if (pitch.inFlight) swungThisPitch = true;
+    }
+  }
+});
+
+function getBatSweetSpotWorld() {
+  // World position of the far end of the bat (the "business end")
+  const local = new THREE.Vector3(0, 0, batLength);
+  return local.applyMatrix4(batGroup.matrixWorld);
+}
+
+function checkSwingCollision() {
+  const sweetSpot = getBatSweetSpotWorld();
+  const d = sweetSpot.distanceTo(ballMesh.position);
+  if (d < HIT_RADIUS && pitch.inFlight) {
+    onBallHit();
+  }
+}
+
+// ---------- Runner: batter sprints to first base after putting the ball in play ----------
+const runner = {
+  active: false,
+  from: new THREE.Vector3(),
+  to: new THREE.Vector3(),
+  speed: 0,
+};
+// ---------- Player attributes (1 = worst, 10 = best): Speed, Throwing, Hitting ----------
+const pitcherAttributes = { name: 'Cy Young', speed: 7, throwing: 9, hitting: 5 };
+const batterAttributes = { name: 'Joe Jackson', speed: 8, throwing: 5, hitting: 8 };
+
+// Hitting rating -> exit velocity multiplier (1 -> -25%, 10 -> +50%)
+function hittingRatingToPowerMultiplier(rating) {
+  const low = 0.75;  // rating 1
+  const high = 1.5;  // rating 10
+  return low + ((rating - 1) / 9) * (high - low);
+}
+
+// Speed rating -> time to first base (1 -> 4s, 10 -> 2s)
+function speedRatingToRunnerSpeed(rating, distance) {
+  const timeToFirst = 4 - ((rating - 1) / 9) * (4 - 2); // linear interpolation, 1->4s, 10->2s
+  return distance / timeToFirst;
+}
+
+function updateRunner(dt) {
+  if (!runner.active) return;
+  const dir = new THREE.Vector3().subVectors(runner.to, batterMesh.position);
+  const dist = dir.length();
+  if (dist < 0.15) {
+    batterMesh.position.copy(runner.to);
+    runner.active = false;
+    return;
+  }
+  dir.normalize();
+  batterMesh.position.addScaledVector(dir, Math.min(runner.speed * dt, dist));
+}
+
+function onBallHit() {
+  pitch.inFlight = false;
+
+  // Batter drops the bat and takes off running toward first base
+  batGroup.visible = false;
+  runner.active = true;
+  runner.from.copy(batterMesh.position);
+  runner.to.set(FIRST.x, batterMesh.position.y, FIRST.z);
+  runner.speed = speedRatingToRunnerSpeed(batterAttributes.speed, runner.from.distanceTo(runner.to));
+
+  // Launch the ball out into fair territory: a random angle between the foul
+  // lines, with some forward power and a launch (vertical) angle.
+  const spreadAngle = (Math.random() - 0.5) * 1.3; // radians, spread across fair territory
+  const baseDir = new THREE.Vector3(0, 0, 1); // toward center field from home
+  const launchDir = new THREE.Vector3(
+    Math.sin(spreadAngle),
+    0,
+    Math.cos(spreadAngle)
+  ).normalize();
+
+  const baseExitSpeed = (55 + Math.random() * 35) * 1.467 * FT * 0.5 * 1.15 * 1.25 * 0.85; // ~55-90mph exit velo, scaled down for field/feel
+  const exitSpeed = baseExitSpeed * hittingRatingToPowerMultiplier(batterAttributes.hitting);
+  const launchAngle = (18 + Math.random() * 20) * (Math.PI / 180); // 18-38 degrees
+
+  inPlay.active = true;
+  inPlay.resting = false;
+  inPlay.touchedGround = false;
+  inPlay.homerunCalled = false;
+  inPlay.velocity.set(
+    launchDir.x * exitSpeed * Math.cos(launchAngle),
+    exitSpeed * Math.sin(launchAngle),
+    launchDir.z * exitSpeed * Math.cos(launchAngle)
+  );
+  ballMesh.position.copy(getBatSweetSpotWorld());
+  ballMesh.position.y = Math.max(ballMesh.position.y, BALL_RADIUS);
+  inPlay.prevPos.copy(ballMesh.position);
+}
+
+// ---------- Player name cards (shown briefly above each player at the start of a play) ----------
+const nameCardPitcherEl = document.getElementById('nameCardPitcher');
+const nameCardBatterEl = document.getElementById('nameCardBatter');
+
+function buildCardHTML(attrs) {
+  return `<div class="name-card-title">${attrs.name}</div>` +
+    `Throwing: ${attrs.throwing} &nbsp; Speed: ${attrs.speed} &nbsp; Hitting: ${attrs.hitting}`;
+}
+nameCardPitcherEl.innerHTML = buildCardHTML(pitcherAttributes);
+nameCardBatterEl.innerHTML = buildCardHTML(batterAttributes);
+
+const nameCards = { visible: false, hideTimer: null };
+
+function showNameCards() {
+  nameCards.visible = true;
+  nameCardPitcherEl.style.opacity = '1';
+  nameCardBatterEl.style.opacity = '1';
+  clearTimeout(nameCards.hideTimer);
+  nameCards.hideTimer = setTimeout(() => {
+    nameCardPitcherEl.style.opacity = '0';
+    nameCardBatterEl.style.opacity = '0';
+    nameCards.visible = false;
+  }, 1500);
+}
+
+function positionCardAbove(el, worldPos, heightAbove) {
+  const p = new THREE.Vector3(worldPos.x, worldPos.y + heightAbove, worldPos.z);
+  p.project(camera);
+  const x = (p.x * 0.5 + 0.5) * innerWidth;
+  const y = (-p.y * 0.5 + 0.5) * innerHeight;
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+}
+
+function updateNameCards() {
+  if (!nameCards.visible) return;
+  positionCardAbove(nameCardPitcherEl, pitcherMesh.position, CAPSULE_TOTAL_HEIGHT * 0.7);
+  positionCardAbove(nameCardBatterEl, batterMesh.position, CAPSULE_TOTAL_HEIGHT * 0.7);
+}
+
+function resetPitchToPitcher() {
+  showNameCards();
+  ballMesh.position.set(
+    pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
+    ballHoldHeight,
+    pitcherMesh.position.z - PLAYER_RADIUS * 0.3
+  );
+  inPlay.active = false;
+  inPlay.resting = false;
+  pitch.inFlight = false;
+  pitch.resetting = false;
+
+  // Batter returns to the box and picks the bat back up
+  runner.active = false;
+  batterMesh.position.copy(batterPos);
+  batGroup.position.set(batterPos.x, (2 / 3) * CAPSULE_TOTAL_HEIGHT, batterPos.z);
+  batGroup.visible = true;
+}
+
+// ---------- Ball-in-play physics (after a hit): gravity, bounce, friction, rest ----------
+const inPlay = {
+  active: false,
+  resting: false,
+  velocity: new THREE.Vector3(),
+  prevPos: new THREE.Vector3(),
+  touchedGround: false,
+  homerunCalled: false,
+};
+const GRAVITY = -32 * FT; // world units/s^2
+const RESTING_SPEED = 0.5; // below this speed (units/s) we consider the ball "at rest"
+
+function segmentIntersect2D(p1, p2, p3, p4) {
+  // Returns {t, point} where the segment p1->p2 crosses segment p3->p4, or null.
+  const d1x = p2.x - p1.x, d1z = p2.z - p1.z;
+  const d2x = p4.x - p3.x, d2z = p4.z - p3.z;
+  const denom = d1x * d2z - d1z * d2x;
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = ((p3.x - p1.x) * d2z - (p3.z - p1.z) * d2x) / denom;
+  const u = ((p3.x - p1.x) * d1z - (p3.z - p1.z) * d1x) / denom;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  return { t, point: new THREE.Vector3(p1.x + d1x * t, 0, p1.z + d1z * t) };
+}
+
+function showPitchCall(message) {
+  const el = document.getElementById('pitchCallText');
+  el.textContent = message;
+  el.classList.remove('show');
+  void el.offsetWidth; // restart animation
+  el.classList.add('show');
+}
+
+function checkHomeRun() {
+  if (inPlay.homerunCalled || inPlay.touchedGround) return;
+  const prev = inPlay.prevPos;
+  const curr = ballMesh.position;
+  for (const seg of fenceSegments) {
+    const hit = segmentIntersect2D(prev, curr, seg.start, seg.end);
+    if (!hit) continue;
+    const heightAtCross = prev.y + (curr.y - prev.y) * hit.t;
+    if (heightAtCross > seg.height + BALL_RADIUS) {
+      // Ball cleared the fence in the air, without ever touching the ground — home run!
+      inPlay.homerunCalled = true;
+      triggerHomeRun();
+      return;
+    }
+  }
+}
+
+function triggerHomeRun() {
+  const overlay = document.getElementById('homerunOverlay');
+  const text = document.getElementById('homerunText');
+  const confettiLayer = document.getElementById('confettiLayer');
+
+  overlay.style.display = 'block';
+  text.classList.remove('playing');
+  // restart the CSS animation
+  void text.offsetWidth;
+  text.classList.add('playing');
+
+  // Spawn a burst of confetti pieces
+  confettiLayer.innerHTML = '';
+  const colors = ['#ffd700', '#ff4136', '#2f7df6', '#ffffff', '#2ecc40', '#ff851b'];
+  const pieceCount = 120;
+  for (let i = 0; i < pieceCount; i++) {
+    const piece = document.createElement('div');
+    piece.className = 'confetti-piece';
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
+    const duration = 2 + Math.random() * 1.5;
+    const delay = Math.random() * 0.6;
+    piece.style.animationDuration = `${duration}s`;
+    piece.style.animationDelay = `${delay}s`;
+    confettiLayer.appendChild(piece);
+  }
+
+  setTimeout(() => {
+    overlay.style.display = 'none';
+    confettiLayer.innerHTML = '';
+    text.classList.remove('playing');
+  }, 3000);
+}
+
+function checkFenceCollision() {
+  if (inPlay.homerunCalled) return; // ball cleared the fence in the air — no bounce, let it sail
+  const prev = inPlay.prevPos;
+  const curr = ballMesh.position;
+  // Quick reject: if both ends of this frame's travel are well above every fence, skip
+  const maxFenceHeight = 8 * FT;
+  if (prev.y > maxFenceHeight + BALL_RADIUS && curr.y > maxFenceHeight + BALL_RADIUS) return;
+
+  let closestHit = null;
+  for (const seg of fenceSegments) {
+    const hit = segmentIntersect2D(prev, curr, seg.start, seg.end);
+    if (!hit) continue;
+    // Height of the ball at the moment it crosses the fence's XZ line (linear interpolation)
+    const heightAtCross = prev.y + (curr.y - prev.y) * hit.t;
+    if (heightAtCross > seg.height + BALL_RADIUS) continue; // flew over the top
+    if (!closestHit || hit.t < closestHit.t) {
+      closestHit = { ...hit, seg, heightAtCross };
+    }
+  }
+
+  if (closestHit) {
+    const seg = closestHit.seg;
+    const segDir = new THREE.Vector3().subVectors(seg.end, seg.start).normalize();
+    // Outward normal: perpendicular to the fence, pointing back toward where the ball came from
+    let normal = new THREE.Vector3(-segDir.z, 0, segDir.x);
+    const fromStart = new THREE.Vector3().subVectors(prev, seg.start);
+    if (fromStart.dot(normal) < 0) normal.negate();
+
+    const collideDist = seg.thickness / 2 + BALL_RADIUS;
+    ballMesh.position.set(
+      closestHit.point.x + normal.x * collideDist,
+      closestHit.heightAtCross,
+      closestHit.point.z + normal.z * collideDist
+    );
+
+    const vHoriz = new THREE.Vector3(inPlay.velocity.x, 0, inPlay.velocity.z);
+    const vDotN = vHoriz.dot(normal);
+    const reflected = new THREE.Vector3().copy(vHoriz).addScaledVector(normal, -2 * vDotN);
+    inPlay.velocity.x = reflected.x * 0.6; // energy loss on the bounce
+    inPlay.velocity.z = reflected.z * 0.6;
+    inPlay.velocity.y *= 0.8;
+  }
+}
+
+function updateBallInPlay(dt) {
+  if (!inPlay.active || inPlay.resting) return;
+
+  inPlay.prevPos.copy(ballMesh.position);
+  inPlay.velocity.y += GRAVITY * dt;
+  ballMesh.position.addScaledVector(inPlay.velocity, dt);
+
+  // Ground collision: bounce with energy loss, plus rolling friction
+  if (ballMesh.position.y <= BALL_RADIUS) {
+    ballMesh.position.y = BALL_RADIUS;
+    inPlay.velocity.y *= -0.4; // lose energy on bounce
+    inPlay.velocity.x *= 0.7;
+    inPlay.velocity.z *= 0.7;
+    inPlay.touchedGround = true;
+  }
+
+  checkHomeRun();
+  checkFenceCollision();
+
+  if (inPlay.velocity.length() < RESTING_SPEED && ballMesh.position.y <= BALL_RADIUS + 0.01) {
+    inPlay.velocity.set(0, 0, 0);
+    inPlay.resting = true;
+    // Ball has come to rest in the field — pause 5 seconds, then reset for the next pitch
+    setTimeout(() => {
+      resetPitchToPitcher();
+    }, 5000);
+  }
+}
+
+
+let swungThisPitch = false;
+
+const pitch = {
+  inFlight: false,
+  resetting: false,
+  startPos: new THREE.Vector3(),
+  velocity: new THREE.Vector3(),
+};
+// ---------- Pitcher throwing rating -> pitch speed (1 -> 60mph, 10 -> 90mph) ----------
+const PITCH_SPEED_MPH = 60 + ((pitcherAttributes.throwing - 1) / 9) * (90 - 60); // linear interpolation
+const PITCH_SPEED = PITCH_SPEED_MPH * 1.467 * FT; // mph -> ft/s -> world units/s
+const PLATE_DEPTH = 1.4; // matches the home plate shape's depth, used for foul lines too
+
+function throwPitch() {
+  if (pitch.inFlight || pitch.resetting || inPlay.active) return;
+  swungThisPitch = false;
+  pitch.inFlight = true;
+  pitch.startPos.copy(ballMesh.position);
+
+  // Travel through home plate and 4ft past the back of it (the plate's point/tip,
+  // which faces the backstop).
+  const dirToHome = new THREE.Vector3(HOME.x - pitch.startPos.x, 0, HOME.z - pitch.startPos.z).normalize();
+  const overshoot = PLATE_DEPTH + 4 * FT;
+  const target = new THREE.Vector3(
+    HOME.x + dirToHome.x * overshoot,
+    ballHoldHeight,
+    HOME.z + dirToHome.z * overshoot
+  );
+
+  pitch.velocity.copy(dirToHome).multiplyScalar(PITCH_SPEED);
+  pitch.target = target;
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    throwPitch();
+  }
+});
+
+// ---------- Gameplay camera: batting view behind home plate, switches to a ----------
+// ---------- zoomed-out ball-follow view once the ball is hit into play. ----------
+const PLATE_DEPTH_REF = 1.4; // matches the plate's depth used elsewhere
+
+const camBattingPos = new THREE.Vector3(
+  HOME.x,
+  22 * FT,
+  HOME.z - PLATE_DEPTH_REF - 30 * FT
+);
+const camBattingLookAt = new THREE.Vector3(
+  HOME.x,
+  2 * FT,
+  moundCenter.z * 0.85
+);
+
+const camCurrentLookAt = camBattingLookAt.clone();
+camera.position.copy(camBattingPos);
+camera.lookAt(camCurrentLookAt);
+
+// How far from home plate counts as "still in the infield" — just past the bases.
+const INFIELD_RADIUS = BASE_DIST * 1.6;
+
+const followCam = {
+  mode: 'tracking',   // 'tracking' while the ball is in the infield, 'zoomingOut' once it leaves
+  zoomOutElapsed: 0,
+  anchorLookAt: new THREE.Vector3(),
+};
+
+function updateCamera(dt) {
+  let desiredPos, desiredLookAt, lerpSpeed;
+
+  if (inPlay.active) {
+    const distFromHome = Math.hypot(ballMesh.position.x - HOME.x, ballMesh.position.z - HOME.z);
+
+    if (followCam.mode === 'tracking' && distFromHome > INFIELD_RADIUS) {
+      // Ball just left the infield — stop chasing it and start a slow continuous zoom-out.
+      followCam.mode = 'zoomingOut';
+      followCam.zoomOutElapsed = 0;
+      followCam.anchorLookAt.copy(ballMesh.position);
+    }
+
+    if (followCam.mode === 'tracking') {
+      // Wide, high angle over the ball while it's still around the infield.
+      desiredPos = new THREE.Vector3(
+        ballMesh.position.x,
+        ballMesh.position.y + 48 * FT,
+        ballMesh.position.z - 42 * FT
+      );
+      desiredLookAt = ballMesh.position;
+      lerpSpeed = 4;
+    } else {
+      // Slowly keep pulling back from the spot where the ball left the infield.
+      followCam.zoomOutElapsed += dt;
+      const growth = 1 + followCam.zoomOutElapsed * 0.12; // gentle, continuous zoom-out
+      desiredPos = new THREE.Vector3(
+        followCam.anchorLookAt.x,
+        followCam.anchorLookAt.y + 55 * FT * growth,
+        followCam.anchorLookAt.z - 50 * FT * growth
+      );
+      desiredLookAt = followCam.anchorLookAt;
+      lerpSpeed = 1.5;
+    }
+  } else {
+    // Back to the tight batting view, behind home plate.
+    desiredPos = camBattingPos;
+    desiredLookAt = camBattingLookAt;
+    followCam.mode = 'tracking';
+    lerpSpeed = 3;
+  }
+
+  const alpha = 1 - Math.pow(0.001, dt * (lerpSpeed / 3));
+  camera.position.lerp(desiredPos, alpha);
+  camCurrentLookAt.lerp(desiredLookAt, alpha);
+  camera.lookAt(camCurrentLookAt);
+}
+
+const clock = new THREE.Clock();
+
+function animate() {
+  const dt = clock.getDelta();
+
+  if (swing.active) {
+    swing.t += dt;
+    const progress = Math.min(swing.t / swing.duration, 1);
+    // Ease through the swing arc from resting position to full extension and back
+    const arc = Math.sin(progress * Math.PI); // 0 -> 1 -> 0
+    batGroup.rotation.y = BAT_REST_ROT + (BAT_SWING_ROT - BAT_REST_ROT) * arc;
+    checkSwingCollision();
+    if (progress >= 1) {
+      swing.active = false;
+      batGroup.rotation.y = BAT_REST_ROT;
+    }
+  }
+
+  if (pitch.inFlight && !inPlay.active) {
+    ballMesh.position.addScaledVector(pitch.velocity, dt);
+    const traveled = ballMesh.position.distanceTo(pitch.startPos);
+    const totalDist = pitch.startPos.distanceTo(pitch.target);
+    if (traveled >= totalDist) {
+      ballMesh.position.copy(pitch.target);
+      pitch.inFlight = false;
+      pitch.resetting = true;
+      showPitchCall(swungThisPitch ? 'Strike!' : 'Ball!');
+      // Pause for 3 seconds at the stopping point, then reset to the pitcher's hand
+      setTimeout(() => {
+        ballMesh.position.set(
+          pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
+          ballHoldHeight,
+          pitcherMesh.position.z - PLAYER_RADIUS * 0.3
+        );
+        pitch.resetting = false;
+      }, 3000);
+    }
+  }
+
+  updateRunner(dt);
+  updateBallInPlay(dt);
+  updateCamera(dt);
+  updateNameCards();
+
+  requestAnimationFrame(animate);
+  renderer.render(scene, camera);
+}
+animate();
+showNameCards(); // show once at the very start, before the first pitch
+</script>
+</body>
+</html>
