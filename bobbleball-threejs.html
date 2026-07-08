@@ -728,7 +728,7 @@ function fielderRatingToChaseSpeed(rating) {
 // Refreshes which players are active (pitcher on the mound, fielders, current
 // batter) to match the current half-inning and batting order.
 function refreshActivePlayers() {
-  pitcherAttributes = currentPitcherAttrs();
+  pitcherAttributes = currentPitcherAttrs(); 
   batterAttributes = currentBatterAttrs();
   nameCardPitcherEl.innerHTML = buildCardHTML(pitcherAttributes);
   nameCardBatterEl.innerHTML = buildCardHTML(batterAttributes);
@@ -776,6 +776,7 @@ const RUNNER_LEAD_FRACTION = 0.3; // how far toward the next base they stray whi
 const RUNNER_ANIM_RATE = 0.5;     // fraction of a basepath leg covered per second
 
 function updateBaseRunnerAnim(dt) {
+  if (inningTransition.phase !== 'none') return; // stranded runners are jogging off with the sides
   const live = inPlay.active && !inPlay.resolved;
   // With two outs there's no reason to hedge: a caught ball ends the inning
   // anyway, so every runner takes off for the next base on contact.
@@ -811,12 +812,6 @@ function syncBaseRunnerMeshes() {
       baseRunnerMeshes[key].position.set(pos.x, standHeight, pos.z);
     }
   }
-}
-
-function clearBases() {
-  gameState.bases = { first: null, second: null, third: null };
-  runnerAnim.t = 0;
-  syncBaseRunnerMeshes();
 }
 
 // Places a runner `index` bases past home (1=first, 2=second, 3=third, 4+=scores).
@@ -856,6 +851,123 @@ function advanceRunnersOnGroundOut() {
   gameState.bases = newBases;
   runnerAnim.t = 0; // occupancy changed: markers restart from their new bags
   syncBaseRunnerMeshes();
+}
+
+// ---------- Inning transition: the sides hustle off and on between half-innings ----------
+// On the third out the retiring defense jogs to its own baseline (home team to
+// the first-base line, visitors to the third-base line), stranded runners jog to
+// their side's baseline, everyone disappears at the line, and the new defense
+// runs on from its baseline to take the field.
+const inningTransition = { phase: 'none', off: [], on: [] }; // phase: 'none' | 'off' | 'on'
+const TRANSITION_SPEED = fielderRatingToChaseSpeed(10) * 1.75; // hustle so the game isn't delayed
+const ON_FIELD_DELAY = 1.5; // seconds before the first of the new defense steps onto the field
+const PITCHER_HOME = pitcherMesh.position.clone();
+const BASELINE_DIRS = {
+  first: new THREE.Vector3().subVectors(FIRST, HOME).normalize(),
+  third: new THREE.Vector3().subVectors(THIRD, HOME).normalize(),
+};
+
+// Nearest point on the given foul line ("first" or "third") to `pos`, kept a
+// sensible stretch out from home so players spread out along the baseline.
+function baselinePoint(pos, side) {
+  const dir = BASELINE_DIRS[side];
+  const t = clamp((pos.x - HOME.x) * dir.x + (pos.z - HOME.z) * dir.z, 30 * FT, 160 * FT);
+  return new THREE.Vector3(HOME.x + dir.x * t, pos.y, HOME.z + dir.z * t);
+}
+
+function teamBaselineSide(team) { return team === teams.home ? 'first' : 'third'; }
+
+function startInningTransition() {
+  const offSide = teamBaselineSide(fieldingTeam());
+  const strandedSide = teamBaselineSide(battingTeam());
+
+  // The retiring defense jogs off as throwaway "ghost" copies, freeing the real
+  // fielder meshes to be restaffed for the new defense immediately — both teams
+  // are on the move at the same time.
+  inningTransition.off = [];
+  for (const mesh of [...fielders.map(f => f.mesh), pitcherMesh]) {
+    const ghost = mesh.clone();
+    ghost.material = mesh.material.clone(); // recoloring the real mesh must not recolor the ghost
+    scene.add(ghost);
+    inningTransition.off.push({ mesh: ghost, target: baselinePoint(mesh.position, offSide), isGhost: true });
+  }
+  // Stranded runners jog to their own side's baseline (their real markers — the
+  // bases are empty next half, so these are free to leave and hide on arrival).
+  for (const key of BASE_ORDER) {
+    const marker = baseRunnerMeshes[key];
+    if (marker.visible) inningTransition.off.push({ mesh: marker, target: baselinePoint(marker.position, strandedSide) });
+  }
+  gameState.bases = { first: null, second: null, third: null };
+  runnerAnim.t = 0;
+
+  // The ball leaves with the old defense: hide it and cancel any in-flight
+  // return throw — it reappears in the new pitcher's hand once everyone's set.
+  ballMesh.visible = false;
+  ballReturn.active = false;
+  ballReturn.waypoints = [];
+  ballReturn.relayFielder = null;
+  throwToFirst.active = false;
+
+  if (gameState.half === 'top') {
+    gameState.half = 'bottom';
+  } else {
+    gameState.half = 'top';
+    gameState.inning++;
+  }
+
+  // New defense takes the field from its own baseline — after a beat, and in a
+  // staggered trickle rather than all nine stepping on at the same instant.
+  refreshActivePlayers();
+  const onSide = teamBaselineSide(fieldingTeam());
+  inningTransition.on = [...fielders.map(f => ({ mesh: f.mesh, home: f.homePos })), { mesh: pitcherMesh, home: PITCHER_HOME }]
+    .map((p, i) => {
+      p.mesh.position.copy(baselinePoint(p.home, onSide));
+      p.mesh.visible = false; // hidden until their own start delay expires
+      return {
+        mesh: p.mesh,
+        target: p.home.clone(),
+        delay: ON_FIELD_DELAY + i * randIn(0.2, 0.45), // trickle on one after another
+      };
+    });
+  inningTransition.phase = 'active';
+}
+
+function updateInningTransition(dt) {
+  if (inningTransition.phase !== 'active') return;
+  const step = (list, onArrive) => {
+    for (let i = list.length - 1; i >= 0; i--) {
+      const item = list[i];
+      if (item.delay > 0) { // not their turn to step onto the field yet
+        item.delay -= dt;
+        if (item.delay > 0) continue;
+        item.mesh.visible = true;
+      }
+      const toTarget = new THREE.Vector3().subVectors(item.target, item.mesh.position);
+      toTarget.y = 0;
+      const dist = toTarget.length();
+      if (dist <= 0.3) {
+        onArrive(item);
+        list.splice(i, 1);
+        continue;
+      }
+      toTarget.normalize();
+      item.mesh.position.addScaledVector(toTarget, Math.min(TRANSITION_SPEED * dt, dist));
+    }
+  };
+  // Each departing player disappears the moment they personally reach the line.
+  step(inningTransition.off, (item) => {
+    item.mesh.visible = false;
+    if (item.isGhost) {
+      scene.remove(item.mesh);
+      item.mesh.material.dispose();
+    }
+  });
+  step(inningTransition.on, () => {});
+  if (inningTransition.off.length === 0 && inningTransition.on.length === 0) {
+    inningTransition.phase = 'none';
+    ballMesh.visible = true; // ball reappears in the new pitcher's hand
+    resetPitchToPitcher();
+  }
 }
 
 // A walk only forces runners who have no open base behind them.
@@ -1154,14 +1266,15 @@ function recordOut() {
   advanceBatter();
   gameState.outs++;
   if (gameState.outs >= 3) {
+    // Side retired: the transition flips the half-inning, jogs the old defense
+    // (and stranded runners) off, and refreshes the players at the swap — so
+    // here just reset the count and scoreboard.
     gameState.outs = 0;
-    clearBases();
-    if (gameState.half === 'top') {
-      gameState.half = 'bottom';
-    } else {
-      gameState.half = 'top';
-      gameState.inning++;
-    }
+    startInningTransition();
+    gameState.balls = 0;
+    gameState.strikes = 0;
+    updateScoreBug();
+    return;
   }
   endAtBat();
 }
@@ -1433,6 +1546,7 @@ function pitcherHandPos() {
 }
 
 function startBallReturn(fielder) {
+  if (inningTransition.phase !== 'none') return; // side retired: the ball leaves with the teams
   const waypoints = [];
   let relayFielder = null;
   if (OUTFIELD_POSITIONS.includes(fielder.posKey)) {
@@ -1529,12 +1643,15 @@ function onThrowReachedFirst() {
     recordHit(1);
   }
   // First baseman has the ball — after a beat, he throws it back to the pitcher.
-  const firstBaseman = fielderByPos('1B');
-  ballReturn.waypoints = [pitcherHandPos()];
-  ballReturn.speed = throwingRatingToThrowSpeed(firstBaseman.attrs.throwing);
-  ballReturn.pause = RELAY_PAUSE;
-  ballReturn.relayFielder = firstBaseman; // hold him at the bag until his throw is away
-  ballReturn.active = true;
+  // (Unless that out retired the side — then the ball leaves with the teams.)
+  if (inningTransition.phase === 'none') {
+    const firstBaseman = fielderByPos('1B');
+    ballReturn.waypoints = [pitcherHandPos()];
+    ballReturn.speed = throwingRatingToThrowSpeed(firstBaseman.attrs.throwing);
+    ballReturn.pause = RELAY_PAUSE;
+    ballReturn.relayFielder = firstBaseman; // hold him at the bag until his throw is away
+    ballReturn.active = true;
+  }
   scheduleResetAfterPlay(1500);
 }
 
@@ -1653,6 +1770,7 @@ function relayAlignment(ballTarget) {
 // Moves each fielder toward the ball (or its cover/relay spot) while it's live,
 // has them catch/field it when close enough, and sends them home otherwise.
 function updateFielders(dt) {
+  if (inningTransition.phase !== 'none') return; // the transition owns everyone's movement
   const chasing = inPlay.active && !inPlay.resolved;
   // Outfielders read the ball off the bat and break toward where it's going to land.
   const landingSpot = (chasing && !inPlay.touchedGround && !inPlay.touchedFence) ? predictLandingSpot() : null;
@@ -1777,6 +1895,7 @@ const PITCH_HEIGHT_SPREAD = CAPSULE_TOTAL_HEIGHT * 0.4; // how far above/below t
 
 function throwPitch() {
   if (pitch.inFlight || pitch.resetting || inPlay.active) return;
+  if (inningTransition.phase !== 'none') return; // teams are still swapping sides
   showNameCards();
   swungThisPitch = false;
   pitch.inFlight = true;
@@ -1946,6 +2065,7 @@ function animate() {
   updateBaseRunnerAnim(dt);
   updateThrowToFirst(dt);
   updateBallReturn(dt);
+  updateInningTransition(dt);
   updateCamera(dt);
   updateNameCards();
 
