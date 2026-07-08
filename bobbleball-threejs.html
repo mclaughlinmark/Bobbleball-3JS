@@ -6,18 +6,15 @@
 <style>
   html, body { margin:0; padding:0; overflow:hidden; background:#111; }
   #c { display:block; width:100vw; height:100vh; }
-  #info {
-    position:fixed; top:10px; left:10px; color:#fff; font-family:Arial, sans-serif;
-    font-size:13px; background:rgba(0,0,0,0.5); padding:8px 12px; border-radius:6px;
-  }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="info">Drag = rotate &nbsp;|&nbsp; Scroll = zoom &nbsp;|&nbsp; Right-drag = pan</div>
 
 <div id="nameCardPitcher" class="name-card"></div>
 <div id="nameCardBatter" class="name-card"></div>
+
+<div id="scoreBug" class="score-bug"></div>
 
 <div id="homerunOverlay" class="homerun-overlay">
   <div id="homerunText" class="homerun-text">HOMERUN!</div>
@@ -123,6 +120,36 @@
     font-weight: bold;
     font-size: 14px;
     margin-bottom: 2px;
+  }
+</style>
+
+<style>
+  .score-bug {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    min-width: 160px;
+    background: rgba(0, 0, 0, 0.25); /* black, 75% transparent - matches name cards */
+    color: #fff;
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-family: Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    pointer-events: none;
+    z-index: 80;
+  }
+  .score-bug .score-bug-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+  }
+  .score-bug .score-bug-team {
+    font-weight: bold;
+  }
+  .score-bug .score-bug-divider {
+    border-top: 1px solid rgba(255, 255, 255, 0.3);
+    margin: 6px 0;
   }
 </style>
 
@@ -566,7 +593,7 @@ scene.add(batGroup);
 const swing = {
   active: false,
   t: 0,
-  duration: 0.25, // seconds for a full swing
+  duration: 0.4, // seconds for a full swing — long enough that an early swing can still catch up to the ball
 };
 const HIT_RADIUS = 1.6; // how close the ball needs to be to the bat's sweet spot to count as a hit
 
@@ -591,83 +618,514 @@ function checkSwingCollision() {
   const sweetSpot = getBatSweetSpotWorld();
   const d = sweetSpot.distanceTo(ballMesh.position);
   if (d < HIT_RADIUS && pitch.inFlight) {
-    onBallHit();
+    // -0.5 = swung early (bat still on its way out), 0 = perfectly on time, +0.5 = swung late.
+    const timingOffset = (swing.t / swing.duration) - 0.5;
+    // 0 = caught it off the end of the bat, 1 = dead-center barrel contact.
+    const proximityQuality = 1 - (d / HIT_RADIUS);
+    onBallHit(timingOffset, proximityQuality);
   }
 }
 
-// ---------- Runner: batter sprints to first base after putting the ball in play ----------
+// ---------- Runner: batter sprints the bases after putting the ball in play ----------
+// `waypoints` is the queue of remaining bases (world positions) to run through;
+// sendRunnerToBase() (below, once rosters/bases exist) fills it in per hit type.
 const runner = {
   active: false,
-  from: new THREE.Vector3(),
-  to: new THREE.Vector3(),
+  waypoints: [],
   speed: 0,
+  attrs: null, // whichever batter this sprite currently represents
 };
-// ---------- Player attributes (1 = worst, 10 = best): Speed, Throwing, Hitting ----------
-const pitcherAttributes = { name: 'Cy Young', speed: 7, throwing: 9, hitting: 5 };
-const batterAttributes = { name: 'Joe Jackson', speed: 8, throwing: 5, hitting: 8 };
+// ---------- Rosters (1 = worst, 10 = best): Speed, Throwing, Hitting ----------
+const homeRoster = [
+  { name: 'Cy Young',         pos: 'P',   speed: 7,  throwing: 9,  hitting: 5 },
+  { name: 'Yogi Berra',       pos: 'C',   speed: 5,  throwing: 10, hitting: 8 },
+  { name: 'Lou Gehrig',       pos: '1B',  speed: 7,  throwing: 8,  hitting: 9 },
+  { name: 'Rogers Hornsby',   pos: '2B',  speed: 7,  throwing: 8,  hitting: 7 },
+  { name: 'George Brett',     pos: '3B',  speed: 6,  throwing: 8,  hitting: 9 },
+  { name: 'Honus Wagner',     pos: 'SS',  speed: 7,  throwing: 9,  hitting: 8 },
+  { name: 'Rickey Henderson', pos: 'LF',  speed: 10, throwing: 6,  hitting: 6 },
+  { name: 'Willie Mays',      pos: 'CF',  speed: 8,  throwing: 8,  hitting: 8 },
+  { name: 'Babe Ruth',        pos: 'RF',  speed: 5,  throwing: 7,  hitting: 10 },
+];
+const visitorRoster = [
+  { name: 'Greg Maddux',      pos: 'P',   speed: 6, throwing: 10, hitting: 6 },
+  { name: 'Gary Carter',      pos: 'C',   speed: 7, throwing: 7,  hitting: 8 },
+  { name: 'Pete Rose',        pos: '1B',  speed: 8, throwing: 6,  hitting: 10 },
+  { name: 'Jackie Robinson',  pos: '2B',  speed: 8, throwing: 6,  hitting: 8 },
+  { name: 'Mike Schmidt',     pos: '3B',  speed: 7, throwing: 7,  hitting: 7 },
+  { name: 'Ozzie Smith',      pos: 'SS',  speed: 8, throwing: 8,  hitting: 6 },
+  { name: 'Barry Bonds',      pos: 'LF',  speed: 8, throwing: 8,  hitting: 8 },
+  { name: 'Dale Murphy',      pos: 'CF',  speed: 7, throwing: 7,  hitting: 8 },
+  { name: 'Hank Aaron',       pos: 'RF',  speed: 7, throwing: 7,  hitting: 9 },
+];
 
-// Hitting rating -> exit velocity multiplier (1 -> -25%, 10 -> +50%)
-function hittingRatingToPowerMultiplier(rating) {
-  const low = 0.75;  // rating 1
-  const high = 1.5;  // rating 10
-  return low + ((rating - 1) / 9) * (high - low);
+// Batting order: everyone bats in roster order, with the pitcher batting last.
+function battingOrderFor(roster) {
+  const order = [];
+  roster.forEach((p, i) => { if (p.pos !== 'P') order.push(i); });
+  order.push(roster.findIndex(p => p.pos === 'P'));
+  return order;
 }
 
-// Speed rating -> time to first base (1 -> 4s, 10 -> 2s)
+const teams = {
+  home:    { roster: homeRoster,    battingOrder: battingOrderFor(homeRoster),    lineupIndex: 0 },
+  visitor: { roster: visitorRoster, battingOrder: battingOrderFor(visitorRoster), lineupIndex: 0 },
+};
+
+function battingTeam()  { return gameState.half === 'top' ? teams.visitor : teams.home; }
+function fieldingTeam() { return gameState.half === 'top' ? teams.home : teams.visitor; }
+function currentBatterAttrs()  { const t = battingTeam(); return t.roster[t.battingOrder[t.lineupIndex]]; }
+function currentPitcherAttrs() { return fieldingTeam().roster.find(p => p.pos === 'P'); }
+function advanceBatter() { const t = battingTeam(); t.lineupIndex = (t.lineupIndex + 1) % t.battingOrder.length; }
+
+// Active pitcher/batter attributes — reassigned by refreshActivePlayers() whenever
+// the batting order advances or the half-inning flips.
+let pitcherAttributes;
+let batterAttributes;
+
+// ---------- Fielders: the 8 non-pitching defenders, placed at standard depth ----------
+// Team colors are fixed to the team, not the batting/fielding role.
+const HOME_COLOR = 0xffffff;
+const VISITOR_COLOR = 0xff3b30;
+const FIELDER_CATCH_RADIUS = 2.0;  // how close a fielder must be to catch a fly ball
+const FIELDER_FIELD_RADIUS = 2.6;  // how close a fielder must be to field a grounder
+const FIELDER_CATCH_HEIGHT = CAPSULE_TOTAL_HEIGHT * 1.6; // max reachable height for a catch
+const OUTFIELD_POSITIONS = ['LF', 'CF', 'RF'];
+const OUTFIELDER_REACTION_DELAY = 0.5; // seconds before an outfielder reads the ball and breaks for the landing spot
+
+// Standing spots in feet from home plate (+Z toward center field, +X toward 3B/left field)
+const FIELD_SPOTS_FT = {
+  C:    { x: 0,   z: -6 },
+  '1B': { x: -46, z: 48 },
+  '2B': { x: -22, z: 110 },
+  SS:   { x: 22,  z: 110 },
+  '3B': { x: 46,  z: 48 },
+  LF:   { x: 85,  z: 175 },
+  CF:   { x: 0,   z: 195 },
+  RF:   { x: -85, z: 175 },
+};
+
+const fielders = Object.keys(FIELD_SPOTS_FT).map((posKey) => {
+  const spot = FIELD_SPOTS_FT[posKey];
+  const homePos = new THREE.Vector3(spot.x * FT, standHeight, HOME.z + spot.z * FT);
+  const mesh = new THREE.Mesh(
+    new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT, 8, 16),
+    new THREE.MeshStandardMaterial({ color: HOME_COLOR, roughness: 0.55 })
+  );
+  mesh.position.copy(homePos);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return { posKey, mesh, homePos, attrs: null };
+});
+
+// Fielder speed rating -> chase speed (1 -> 11ft/s, 10 -> 22ft/s)
+function fielderRatingToChaseSpeed(rating) {
+  const ftPerSec = 11 + ((rating - 1) / 9) * (22 - 11);
+  return ftPerSec * FT;
+}
+
+// Refreshes which players are active (pitcher on the mound, fielders, current
+// batter) to match the current half-inning and batting order.
+function refreshActivePlayers() {
+  pitcherAttributes = currentPitcherAttrs();
+  batterAttributes = currentBatterAttrs();
+  nameCardPitcherEl.innerHTML = buildCardHTML(pitcherAttributes);
+  nameCardBatterEl.innerHTML = buildCardHTML(batterAttributes);
+
+  const fielding = fieldingTeam();
+  const fieldColor = fielding === teams.home ? HOME_COLOR : VISITOR_COLOR;
+  pitcherMesh.material.color.set(fieldColor);
+  for (const f of fielders) {
+    f.attrs = fielding.roster.find(p => p.pos === f.posKey);
+    f.mesh.material.color.set(fieldColor);
+  }
+
+  const batting = battingTeam();
+  batterMesh.material.color.set(batting === teams.home ? HOME_COLOR : VISITOR_COLOR);
+}
+
+// ---------- Base runners: persistent state for who's on base between pitches ----------
+const BASE_ORDER = ['first', 'second', 'third'];
+const BASE_WORLD_POS = { first: FIRST, second: SECOND, third: THIRD };
+
+function makeRunnerMarker() {
+  const mesh = new THREE.Mesh(
+    new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT, 8, 16),
+    new THREE.MeshStandardMaterial({ color: 0xffa500, roughness: 0.55 })
+  );
+  mesh.visible = false;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+// Orange markers showing which bases are currently occupied.
+const baseRunnerMeshes = { first: makeRunnerMarker(), second: makeRunnerMarker(), third: makeRunnerMarker() };
+
+function syncBaseRunnerMeshes() {
+  for (const key of BASE_ORDER) {
+    const occupant = gameState.bases[key];
+    // While the batter's own sprite is still sprinting toward this base, let
+    // that sprite alone represent them — don't show a marker there in advance.
+    const stillEnRoute = runner.active && occupant === runner.attrs;
+    const occupied = !!occupant && !stillEnRoute;
+    baseRunnerMeshes[key].visible = occupied;
+    if (occupied) {
+      const pos = BASE_WORLD_POS[key];
+      baseRunnerMeshes[key].position.set(pos.x, standHeight, pos.z);
+    }
+  }
+}
+
+function clearBases() {
+  gameState.bases = { first: null, second: null, third: null };
+  syncBaseRunnerMeshes();
+}
+
+// Places a runner `index` bases past home (1=first, 2=second, 3=third, 4+=scores).
+function placeAtBaseIndex(newBases, index, runnerAttrs) {
+  if (index >= 4) {
+    gameState[battingTeamScoreKey()]++;
+    return;
+  }
+  newBases[BASE_ORDER[index - 1]] = runnerAttrs;
+}
+
+// A batted-ball hit advances every existing runner the same number of bases as
+// the batter; anyone pushed past third scores.
+function advanceRunnersForHit(bases, batterAttrs) {
+  const newBases = { first: null, second: null, third: null };
+  BASE_ORDER.forEach((baseKey, i) => {
+    const occupant = gameState.bases[baseKey];
+    if (occupant) placeAtBaseIndex(newBases, (i + 1) + bases, occupant);
+  });
+  placeAtBaseIndex(newBases, bases, batterAttrs);
+  gameState.bases = newBases;
+  syncBaseRunnerMeshes();
+}
+
+// A walk only forces runners who have no open base behind them.
+function advanceRunnersForWalk(batterAttrs) {
+  if (gameState.bases.first) {
+    if (gameState.bases.second) {
+      if (gameState.bases.third) {
+        gameState[battingTeamScoreKey()]++;
+      }
+      gameState.bases.third = gameState.bases.second;
+    }
+    gameState.bases.second = gameState.bases.first;
+  }
+  gameState.bases.first = batterAttrs;
+  syncBaseRunnerMeshes();
+}
+
+// Sends the batter's own runner mesh sprinting through `bases` bases in
+// sequence (1 = first only, up through 4 = around to home on a home run).
+function sendRunnerToBase(bases) {
+  runner.waypoints = [FIRST, SECOND, THIRD, HOME].slice(0, bases)
+    .map(b => new THREE.Vector3(b.x, batterMesh.position.y, b.z));
+  runner.speed = speedRatingToRunnerSpeed(batterAttributes.speed, HOME.distanceTo(FIRST));
+  runner.attrs = batterAttributes; // capture identity now — batterAttributes reassigns once the at-bat ends
+  runner.active = true;
+}
+
+// Speed rating -> time to reach first base (1 -> 4s, 10 -> 2s)
+function speedRatingToTimeToFirst(rating) {
+  return 4 - ((rating - 1) / 9) * (4 - 2); // linear interpolation
+}
 function speedRatingToRunnerSpeed(rating, distance) {
-  const timeToFirst = 4 - ((rating - 1) / 9) * (4 - 2); // linear interpolation, 1->4s, 10->2s
-  return distance / timeToFirst;
+  return distance / speedRatingToTimeToFirst(rating);
 }
-
 function updateRunner(dt) {
-  if (!runner.active) return;
-  const dir = new THREE.Vector3().subVectors(runner.to, batterMesh.position);
+  if (!runner.active || runner.waypoints.length === 0) return;
+  const target = runner.waypoints[0];
+  const dir = new THREE.Vector3().subVectors(target, batterMesh.position);
   const dist = dir.length();
   if (dist < 0.15) {
-    batterMesh.position.copy(runner.to);
-    runner.active = false;
+    batterMesh.position.copy(target);
+    runner.waypoints.shift();
+    if (runner.waypoints.length === 0) {
+      runner.active = false;
+      syncBaseRunnerMeshes(); // reveal this runner's marker now that their sprite has arrived
+    }
     return;
   }
   dir.normalize();
   batterMesh.position.addScaledVector(dir, Math.min(runner.speed * dt, dist));
 }
 
-function onBallHit() {
+// ---------- Hitting engine: outcome-first, tuned to real baseball rates ----------
+// A ball put in play becomes a hit about 3 times in 10. Singles are by far the
+// most common hit, then doubles and home runs, with triples rare. The engine
+// rolls WHAT the play becomes first (nudged by the batter/pitcher matchup and
+// how clean the swing contact was), then synthesizes a batted ball to match:
+// weak and hard grounders at or through the infield, pop-ups over the infield,
+// shallow and deep flies to the outfield, liners, gap shots, corner shots, and
+// drives over the fence. The defense still animates the play, but the called
+// result stands — like a real box score.
+
+const INFIELD_KEYS = ['1B', '2B', 'SS', '3B'];
+const SPRAY_LIMIT = Math.PI / 4 - 0.08; // keep batted balls inside the foul lines (±45°)
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+function randIn(lo, hi) { return lo + Math.random() * (hi - lo); }
+function pickWeighted(entries) { // entries: [[value, weight], ...]
+  const total = entries.reduce((sum, e) => sum + Math.max(0, e[1]), 0);
+  let r = Math.random() * total;
+  for (const [value, weight] of entries) {
+    r -= Math.max(0, weight);
+    if (r <= 0) return value;
+  }
+  return entries[entries.length - 1][0];
+}
+
+// Horizontal spray angle (radians off dead center field; the foul lines are ±45°)
+function sprayToDir(spray) { return new THREE.Vector3(Math.sin(spray), 0, Math.cos(spray)); }
+function sprayToward(point) { return clamp(Math.atan2(point.x - HOME.x, point.z - HOME.z), -SPRAY_LIMIT, SPRAY_LIMIT); }
+function fielderByPos(posKey) { return fielders.find(f => f.posKey === posKey); }
+function randomFielderFrom(keys) { return fielderByPos(keys[Math.floor(Math.random() * keys.length)]); }
+function distToHome(point) { return Math.hypot(point.x - HOME.x, point.z - HOME.z); }
+
+// Distance from home plate to the outfield fence along a spray direction.
+function fenceDistanceAlongDir(dir) {
+  const far = new THREE.Vector3().copy(HOME).addScaledVector(dir, FIELD_SIZE * 2);
+  let best = null;
+  for (const seg of fenceSegments) {
+    const hit = segmentIntersect2D(HOME, far, seg.start, seg.end);
+    if (!hit) continue;
+    const d = distToHome(hit.point);
+    if (best === null || d < best) best = d;
+  }
+  return best ?? 220 * FT;
+}
+
+// Exit speed that carries a ball `dist` world units at `angleRad` (flat ground, no drag).
+function speedForCarry(dist, angleRad) {
+  return Math.sqrt(Math.max(dist, 1) * -GRAVITY / Math.max(Math.sin(2 * angleRad), 0.05));
+}
+
+// Finds a landing spot between `minDistFt` and `maxDistFt` from home that's as far
+// from every defender as possible — where bloops and soft liners "find grass".
+function pickLandingAwayFromFielders(minDistFt, maxDistFt) {
+  let best = null;
+  for (let i = 0; i < 16; i++) {
+    const spray = randIn(-SPRAY_LIMIT, SPRAY_LIMIT);
+    const dist = randIn(minDistFt, maxDistFt) * FT;
+    const p = new THREE.Vector3().copy(HOME).addScaledVector(sprayToDir(spray), dist);
+    const gap = Math.min(...fielders.map(f => Math.hypot(p.x - f.homePos.x, p.z - f.homePos.z)));
+    if (!best || gap > best.gap) best = { spray, dist, gap };
+  }
+  return best;
+}
+
+// Rolls what the play becomes. `quality` is 0..1 swing contact quality.
+function rollPlayOutcome(quality) {
+  const matchup = (batterAttributes.hitting - pitcherAttributes.throwing) / 9; // -1..1
+  const hitChance = clamp(0.30 + matchup * 0.08 + (quality - 0.5) * 0.18, 0.12, 0.55);
+
+  if (Math.random() >= hitChance) {
+    // An out. Weak contact tends to stay on the ground or go straight up;
+    // good contact that still gets caught tends to be a liner or a deep fly.
+    return pickWeighted([
+      ['ground_out',      42 - quality * 10],
+      ['popup_infield',   14 - quality * 6],
+      ['fly_out_shallow', 20],
+      ['fly_out_deep',    12 + quality * 14],
+      ['line_out',        8 + quality * 6],
+    ]);
+  }
+
+  // A hit. Power hitters and flush contact tilt doubles/homers up; fast
+  // runners leg out the occasional triple.
+  const power = (batterAttributes.hitting - 5.5) / 4.5 + (quality - 0.5); // ~ -1.5..1.5
+  return pickWeighted([
+    ['single', 65],
+    ['double', 20 * (1 + 0.35 * power)],
+    ['triple', 1.5 + batterAttributes.speed * 0.25],
+    ['homer',  11 * (1 + 0.75 * power)],
+  ]);
+}
+
+const PLAY_TYPE_BASES = { single: 1, double: 2, triple: 3, homer: 4 }; // everything else is an out
+
+// Builds the batted ball for a play type: spray angle, launch angle, exit speed.
+function buildBattedBall(playType) {
+  const jitter = () => randIn(-0.05, 0.05);
+  const deg = Math.PI / 180;
+  switch (playType) {
+    case 'ground_out': { // weak-to-firm grounder right at an infielder
+      const f = randomFielderFrom(INFIELD_KEYS);
+      return { spray: sprayToward(f.homePos) + jitter(), angleDeg: randIn(-4, 8), speed: randIn(14, 26) };
+    }
+    case 'popup_infield': { // sky-high pop that comes down on the infield
+      const f = randomFielderFrom(INFIELD_KEYS);
+      const angleDeg = randIn(62, 76);
+      const dist = distToHome(f.homePos) * randIn(0.8, 1.0);
+      return { spray: sprayToward(f.homePos) + jitter(), angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'fly_out_shallow': { // can of corn in front of an outfielder
+      const f = randomFielderFrom(OUTFIELD_POSITIONS);
+      const angleDeg = randIn(38, 52);
+      const dist = distToHome(f.homePos) * randIn(0.75, 1.0);
+      return { spray: sprayToward(f.homePos) + jitter(), angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'fly_out_deep': { // driven toward the track, run down by the outfielder
+      const f = randomFielderFrom(OUTFIELD_POSITIONS);
+      const spray = sprayToward(f.homePos) + jitter() * 2;
+      const angleDeg = randIn(34, 44);
+      const dist = fenceDistanceAlongDir(sprayToDir(spray)) * randIn(0.78, 0.92);
+      return { spray, angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'line_out': { // rope hit right at a defender
+      const f = randomFielderFrom([...INFIELD_KEYS, ...OUTFIELD_POSITIONS]);
+      const angleDeg = randIn(10, 18);
+      const dist = distToHome(f.homePos) * randIn(0.96, 1.04);
+      return { spray: sprayToward(f.homePos) + jitter() * 0.5, angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'single': {
+      if (Math.random() < 0.6) {
+        // Hard grounder through a hole in the infield, out to an outfielder.
+        // Holes sit between the infielders (their spots are at roughly ±0.2
+        // and ±0.76 radians of spray) plus up the middle past the mound.
+        const hole = pickWeighted([[-0.48, 1], [0.48, 1], [0, 0.7], [-0.66, 0.5], [0.66, 0.5]]);
+        return { spray: clamp(hole + jitter(), -SPRAY_LIMIT, SPRAY_LIMIT), angleDeg: randIn(0, 7), speed: randIn(30, 40) };
+      }
+      // Soft liner / bloop that drops between the infield and the outfield.
+      const spot = pickLandingAwayFromFielders(110, 150);
+      const angleDeg = randIn(22, 34);
+      return { spray: spot.spray, angleDeg, speed: speedForCarry(spot.dist, angleDeg * deg) };
+    }
+    case 'double': { // liner into one of the outfield gaps, rolling to the wall
+      const spray = clamp((Math.random() < 0.5 ? -0.24 : 0.24) + jitter() * 2, -SPRAY_LIMIT, SPRAY_LIMIT);
+      const angleDeg = randIn(16, 24);
+      const dist = fenceDistanceAlongDir(sprayToDir(spray)) * randIn(0.88, 1.0);
+      return { spray, angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'triple': { // shot down one of the lines, into a corner
+      const spray = (Math.random() < 0.5 ? -1 : 1) * randIn(0.56, SPRAY_LIMIT);
+      const angleDeg = randIn(13, 20);
+      const dist = fenceDistanceAlongDir(sprayToDir(spray)) * randIn(0.85, 0.98);
+      return { spray, angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+    case 'homer': { // no-doubter over the fence
+      const spray = randIn(-0.55, 0.55);
+      const angleDeg = randIn(26, 35);
+      const dist = fenceDistanceAlongDir(sprayToDir(spray)) * randIn(1.2, 1.45);
+      return { spray, angleDeg, speed: speedForCarry(dist, angleDeg * deg) };
+    }
+  }
+}
+
+// timingOffset: -0.5 (early) .. 0 (perfect) .. +0.5 (late). proximityQuality: 0 (off
+// the end of the bat) .. 1 (flush barrel contact). Together they set the swing's
+// contact quality, which nudges the outcome roll — but the roll, not physics
+// randomness, decides the play.
+function onBallHit(timingOffset, proximityQuality) {
   pitch.inFlight = false;
 
-  // Batter drops the bat and takes off running toward first base
+  // Batter drops the bat and takes off running toward first base — the runner
+  // system extends this further (2nd/3rd/home) once the play is resolved.
   batGroup.visible = false;
-  runner.active = true;
-  runner.from.copy(batterMesh.position);
-  runner.to.set(FIRST.x, batterMesh.position.y, FIRST.z);
-  runner.speed = speedRatingToRunnerSpeed(batterAttributes.speed, runner.from.distanceTo(runner.to));
+  sendRunnerToBase(1);
 
-  // Launch the ball out into fair territory: a random angle between the foul
-  // lines, with some forward power and a launch (vertical) angle.
-  const spreadAngle = (Math.random() - 0.5) * 1.3; // radians, spread across fair territory
-  const baseDir = new THREE.Vector3(0, 0, 1); // toward center field from home
-  const launchDir = new THREE.Vector3(
-    Math.sin(spreadAngle),
-    0,
-    Math.cos(spreadAngle)
-  ).normalize();
-
-  const baseExitSpeed = (55 + Math.random() * 35) * 1.467 * FT * 0.5 * 1.15 * 1.25 * 0.85; // ~55-90mph exit velo, scaled down for field/feel
-  const exitSpeed = baseExitSpeed * hittingRatingToPowerMultiplier(batterAttributes.hitting);
-  const launchAngle = (18 + Math.random() * 20) * (Math.PI / 180); // 18-38 degrees
+  const quality = clamp(proximityQuality - Math.abs(timingOffset) * 0.6, 0, 1);
+  const playType = rollPlayOutcome(quality);
+  const { spray, angleDeg, speed } = buildBattedBall(playType);
+  const launchAngle = angleDeg * (Math.PI / 180);
+  const launchDir = sprayToDir(spray);
 
   inPlay.active = true;
   inPlay.resting = false;
   inPlay.touchedGround = false;
+  inPlay.touchedFence = false;
   inPlay.homerunCalled = false;
+  inPlay.resolved = false;
+  inPlay.calledBases = PLAY_TYPE_BASES[playType] ?? 0;
+  hitClock = 0;
   inPlay.velocity.set(
-    launchDir.x * exitSpeed * Math.cos(launchAngle),
-    exitSpeed * Math.sin(launchAngle),
-    launchDir.z * exitSpeed * Math.cos(launchAngle)
+    launchDir.x * speed * Math.cos(launchAngle),
+    speed * Math.sin(launchAngle),
+    launchDir.z * speed * Math.cos(launchAngle)
   );
   ballMesh.position.copy(getBatSweetSpotWorld());
   ballMesh.position.y = Math.max(ballMesh.position.y, BALL_RADIUS);
   inPlay.prevPos.copy(ballMesh.position);
+}
+
+// ---------- Score bug (always visible, top-right): score, inning, outs, count ----------
+const gameState = {
+  visitorScore: 0,
+  homeScore: 0,
+  inning: 1,
+  half: 'top', // 'top' = visitor batting, 'bottom' = home batting
+  outs: 0,
+  balls: 0,
+  strikes: 0,
+  bases: { first: null, second: null, third: null }, // occupant = that runner's roster attrs, or null
+};
+
+function battingTeamScoreKey() {
+  return gameState.half === 'top' ? 'visitorScore' : 'homeScore';
+}
+
+function updateScoreBug() {
+  const halfSymbol = gameState.half === 'top' ? '▲' : '▼';
+  document.getElementById('scoreBug').innerHTML =
+    `<div class="score-bug-row"><span class="score-bug-team">Visitor</span><span>${gameState.visitorScore}</span></div>` +
+    `<div class="score-bug-row"><span class="score-bug-team">Home</span><span>${gameState.homeScore}</span></div>` +
+    `<div class="score-bug-divider"></div>` +
+    `<div class="score-bug-row"><span>${halfSymbol} Inning ${gameState.inning}</span><span>${gameState.outs} Out${gameState.outs === 1 ? '' : 's'}</span></div>` +
+    `<div class="score-bug-row"><span>Count</span><span>${gameState.balls}-${gameState.strikes}</span></div>`;
+}
+updateScoreBug();
+
+// Ends the current at-bat: resets the ball/strike count and refreshes the
+// active pitcher/batter/fielders for whoever is up next.
+function endAtBat() {
+  gameState.balls = 0;
+  gameState.strikes = 0;
+  refreshActivePlayers();
+  updateScoreBug();
+}
+
+// Ends the current batter's plate appearance as an out (strikeout, caught fly,
+// or a grounder fielded in time to beat the runner to first).
+function recordOut() {
+  advanceBatter();
+  gameState.outs++;
+  if (gameState.outs >= 3) {
+    gameState.outs = 0;
+    clearBases();
+    if (gameState.half === 'top') {
+      gameState.half = 'bottom';
+    } else {
+      gameState.half = 'top';
+      gameState.inning++;
+    }
+  }
+  endAtBat();
+}
+
+// Batter draws a walk: only forces runners who have no open base behind them.
+function recordWalk() {
+  advanceRunnersForWalk(batterAttributes);
+  advanceBatter();
+  endAtBat();
+}
+
+// Batter reaches base on a batted ball the defense couldn't retire in time;
+// every existing runner advances the same number of bases as the batter.
+function recordHit(bases) {
+  advanceRunnersForHit(bases, batterAttributes);
+  advanceBatter();
+  endAtBat();
+}
+
+function recordHomeRun() {
+  advanceRunnersForHit(4, batterAttributes);
+  advanceBatter();
+  endAtBat();
 }
 
 // ---------- Player name cards (shown briefly above each player at the start of a play) ----------
@@ -678,8 +1136,7 @@ function buildCardHTML(attrs) {
   return `<div class="name-card-title">${attrs.name}</div>` +
     `Throwing: ${attrs.throwing} &nbsp; Speed: ${attrs.speed} &nbsp; Hitting: ${attrs.hitting}`;
 }
-nameCardPitcherEl.innerHTML = buildCardHTML(pitcherAttributes);
-nameCardBatterEl.innerHTML = buildCardHTML(batterAttributes);
+refreshActivePlayers();
 
 const nameCards = { visible: false, hideTimer: null };
 
@@ -692,7 +1149,7 @@ function showNameCards() {
     nameCardPitcherEl.style.opacity = '0';
     nameCardBatterEl.style.opacity = '0';
     nameCards.visible = false;
-  }, 1500);
+  }, 2000);
 }
 
 function positionCardAbove(el, worldPos, heightAbove) {
@@ -711,7 +1168,6 @@ function updateNameCards() {
 }
 
 function resetPitchToPitcher() {
-  showNameCards();
   ballMesh.position.set(
     pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
     ballHoldHeight,
@@ -719,6 +1175,7 @@ function resetPitchToPitcher() {
   );
   inPlay.active = false;
   inPlay.resting = false;
+  inPlay.homerunCalled = false; // release the camera's home-run-follow lock
   pitch.inFlight = false;
   pitch.resetting = false;
 
@@ -736,10 +1193,33 @@ const inPlay = {
   velocity: new THREE.Vector3(),
   prevPos: new THREE.Vector3(),
   touchedGround: false,
+  touchedFence: false, // once the ball's hit the fence, it can no longer be caught for an out
   homerunCalled: false,
+  resolved: false, // true once a home run is called or a fielder has caught/fielded the ball
+  calledBases: 0, // the play's pre-rolled result: 0 = out, 1-3 = single/double/triple, 4 = homer
 };
 const GRAVITY = -32 * FT; // world units/s^2
 const RESTING_SPEED = 0.5; // below this speed (units/s) we consider the ball "at rest"
+let hitClock = 0; // seconds elapsed since the ball was put in play, used to time defensive plays
+
+// Predicts where an airborne ball will hit the ground, given its current
+// position/velocity and constant gravity — lets fielders break toward the
+// landing spot instead of just chasing wherever the ball currently is.
+function predictLandingSpot() {
+  const pos = ballMesh.position;
+  const vel = inPlay.velocity;
+  const a = 0.5 * GRAVITY;
+  const b = vel.y;
+  const c = pos.y - BALL_RADIUS;
+  const disc = b * b - 4 * a * c;
+  let t = 0.5;
+  if (disc >= 0 && Math.abs(a) > 1e-6) {
+    const sqrtDisc = Math.sqrt(disc);
+    t = Math.max((-b + sqrtDisc) / (2 * a), (-b - sqrtDisc) / (2 * a));
+    if (t < 0) t = 0.1;
+  }
+  return new THREE.Vector3(pos.x + vel.x * t, pos.y, pos.z + vel.z * t);
+}
 
 function segmentIntersect2D(p1, p2, p3, p4) {
   // Returns {t, point} where the segment p1->p2 crosses segment p3->p4, or null.
@@ -761,6 +1241,19 @@ function showPitchCall(message) {
   el.classList.add('show');
 }
 
+// Resets for the next pitch no sooner than `minDelayMs`, and not until the
+// runner's sprite has actually finished rounding the bases (whichever is later).
+function scheduleResetAfterPlay(minDelayMs) {
+  const startedAt = Date.now();
+  (function poll() {
+    if (!runner.active && !ballReturn.active && Date.now() - startedAt >= minDelayMs) {
+      resetPitchToPitcher();
+    } else {
+      setTimeout(poll, 200);
+    }
+  })();
+}
+
 function checkHomeRun() {
   if (inPlay.homerunCalled || inPlay.touchedGround) return;
   const prev = inPlay.prevPos;
@@ -772,7 +1265,11 @@ function checkHomeRun() {
     if (heightAtCross > seg.height + BALL_RADIUS) {
       // Ball cleared the fence in the air, without ever touching the ground — home run!
       inPlay.homerunCalled = true;
+      inPlay.resolved = true;
+      sendRunnerToBase(4);
+      recordHomeRun();
       triggerHomeRun();
+      scheduleResetAfterPlay(3000);
       return;
     }
   }
@@ -833,6 +1330,7 @@ function checkFenceCollision() {
   }
 
   if (closestHit) {
+    inPlay.touchedFence = true; // once it's hit the fence, it can no longer be caught for an out
     const seg = closestHit.seg;
     const segDir = new THREE.Vector3().subVectors(seg.end, seg.start).normalize();
     // Outward normal: perpendicular to the fence, pointing back toward where the ball came from
@@ -856,9 +1354,148 @@ function checkFenceCollision() {
   }
 }
 
-function updateBallInPlay(dt) {
-  if (!inPlay.active || inPlay.resting) return;
+// ---------- Ball return: after a catch, throw the ball back in (relayed ----------
+// ---------- through the infield for outfielders) and back to the pitcher. ----------
+const ballReturn = {
+  active: false,
+  waypoints: [],
+  speed: 0,
+};
 
+function pitcherHandPos() {
+  return new THREE.Vector3(
+    pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
+    ballHoldHeight,
+    pitcherMesh.position.z - PLAYER_RADIUS * 0.3
+  );
+}
+
+function startBallReturn(fielder) {
+  const relay = OUTFIELD_POSITIONS.includes(fielder.posKey)
+    ? [new THREE.Vector3(SECOND.x, ballHoldHeight, SECOND.z)] // outfield catch: relay in through the infield first
+    : []; // infield catch: toss it straight back to the pitcher
+  ballReturn.waypoints = [...relay, pitcherHandPos()];
+  ballReturn.speed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
+  ballReturn.active = true;
+}
+
+function updateBallReturn(dt) {
+  if (!ballReturn.active || ballReturn.waypoints.length === 0) return;
+  const target = ballReturn.waypoints[0];
+  const dir = new THREE.Vector3().subVectors(target, ballMesh.position);
+  const dist = dir.length();
+  if (dist < 0.3) {
+    ballMesh.position.copy(target);
+    ballReturn.waypoints.shift();
+    if (ballReturn.waypoints.length === 0) ballReturn.active = false;
+    return;
+  }
+  dir.normalize();
+  ballMesh.position.addScaledVector(dir, Math.min(ballReturn.speed * dt, dist));
+}
+
+// A fielder has reached the ball. The play's result was already rolled at
+// contact (inPlay.calledBases) — the defense's animation sells the play, but
+// the called result stands, whether the ball was caught in the air or fielded
+// off the ground and (implicitly) thrown in ahead of or behind the runner.
+function fieldBall(fielder) {
+  if (inPlay.resolved) return;
+  inPlay.resolved = true;
+  inPlay.velocity.set(0, 0, 0);
+  ballMesh.position.copy(fielder.mesh.position);
+  ballMesh.position.y = Math.max(BALL_RADIUS, ballMesh.position.y);
+
+  // A ball called for 4 bases should have left the yard; if it somehow banged
+  // off the wall and stayed in, the batter settles for a triple off the wall.
+  const bases = Math.min(inPlay.calledBases, 3);
+  if (bases === 0) {
+    runner.active = false;
+    showPitchCall('Out!');
+    recordOut();
+    startBallReturn(fielder);
+  } else {
+    sendRunnerToBase(bases);
+    showPitchCall(bases === 1 ? 'Single!' : bases === 2 ? 'Double!' : 'Triple!');
+    recordHit(bases);
+  }
+  scheduleResetAfterPlay(3000);
+}
+
+// Keeps a point from crossing to the far side of any outfield fence segment —
+// used to stop fielders from running through the wall while chasing a ball.
+function clampToPlayableField(pos) {
+  for (const seg of fenceSegments) {
+    const segDir = new THREE.Vector3().subVectors(seg.end, seg.start).normalize();
+    const segLen = seg.start.distanceTo(seg.end);
+    let normal = new THREE.Vector3(-segDir.z, 0, segDir.x); // perpendicular to the fence
+    // Orient inward, back toward home plate (same convention as the ball's fence-bounce code).
+    const fromStart = new THREE.Vector3().subVectors(HOME, seg.start);
+    if (fromStart.dot(normal) < 0) normal.negate();
+
+    const rel = new THREE.Vector3().subVectors(pos, seg.start);
+    const t = rel.dot(segDir);
+    if (t < 0 || t > segLen) continue; // this segment's span doesn't cover this point
+    const inwardDist = rel.dot(normal);
+    const buffer = seg.thickness / 2 + PLAYER_RADIUS;
+    if (inwardDist < buffer) {
+      pos.addScaledVector(normal, buffer - inwardDist);
+    }
+  }
+  return pos;
+}
+
+// Moves each fielder toward the ball while it's live, has them catch/field it
+// when close enough, and sends them back to their positions otherwise.
+function updateFielders(dt) {
+  const chasing = inPlay.active && !inPlay.resolved;
+  // Outfielders read the ball off the bat and break toward where it's going to
+  // land; infielders react to the ball's actual (current) position.
+  const landingSpot = (chasing && !inPlay.touchedGround && !inPlay.touchedFence) ? predictLandingSpot() : null;
+  for (const f of fielders) {
+    const isOutfielder = OUTFIELD_POSITIONS.includes(f.posKey);
+    let target;
+    if (!chasing) {
+      target = f.homePos;
+    } else if (isOutfielder && landingSpot) {
+      // Hold position for a beat while reading the ball off the bat, then break for the landing spot.
+      target = hitClock < OUTFIELDER_REACTION_DELAY
+        ? f.homePos
+        : new THREE.Vector3(landingSpot.x, f.mesh.position.y, landingSpot.z);
+    } else {
+      target = new THREE.Vector3(ballMesh.position.x, f.mesh.position.y, ballMesh.position.z);
+    }
+    const toTarget = new THREE.Vector3().subVectors(target, f.mesh.position);
+    const dist = toTarget.length();
+    if (dist > 0.05) {
+      toTarget.normalize();
+      const spd = fielderRatingToChaseSpeed(f.attrs.speed);
+      f.mesh.position.addScaledVector(toTarget, Math.min(spd * dt, dist));
+      clampToPlayableField(f.mesh.position);
+    }
+
+    if (chasing) {
+      const horizDist = Math.hypot(f.mesh.position.x - ballMesh.position.x, f.mesh.position.z - ballMesh.position.z);
+      // Air catches only happen on plays called as outs — a ball called a hit
+      // always finds grass (or the wall), so a nearby fielder plays it on the
+      // hop instead of turning a called single into a catch. A ball that's
+      // touched the fence is a live ball off the wall, no longer catchable.
+      if (inPlay.calledBases === 0 &&
+          !inPlay.touchedGround && !inPlay.touchedFence && horizDist < FIELDER_CATCH_RADIUS && ballMesh.position.y <= FIELDER_CATCH_HEIGHT) {
+        fieldBall(f);
+        return;
+      }
+      if ((inPlay.touchedGround || inPlay.touchedFence) && horizDist < FIELDER_FIELD_RADIUS) {
+        fieldBall(f);
+        return;
+      }
+    }
+  }
+}
+
+function updateBallInPlay(dt) {
+  if (!inPlay.active || inPlay.resting || inPlay.resolved) return;
+
+  hitClock += dt;
   inPlay.prevPos.copy(ballMesh.position);
   inPlay.velocity.y += GRAVITY * dt;
   ballMesh.position.addScaledVector(inPlay.velocity, dt);
@@ -878,10 +1515,11 @@ function updateBallInPlay(dt) {
   if (inPlay.velocity.length() < RESTING_SPEED && ballMesh.position.y <= BALL_RADIUS + 0.01) {
     inPlay.velocity.set(0, 0, 0);
     inPlay.resting = true;
-    // Ball has come to rest in the field — pause 5 seconds, then reset for the next pitch
-    setTimeout(() => {
-      resetPitchToPitcher();
-    }, 5000);
+    // Don't resolve the play just because the ball stopped rolling — leave it live so
+    // updateFielders() keeps converging on it and fieldBall() decides the outcome (out,
+    // single, double, or triple) the instant someone actually picks it up, exactly like
+    // a ball that's still moving. A weak roller a few feet in front of home has no reason
+    // to become an automatic double just because nobody was standing on it yet.
   }
 }
 
@@ -894,28 +1532,36 @@ const pitch = {
   startPos: new THREE.Vector3(),
   velocity: new THREE.Vector3(),
 };
-// ---------- Pitcher throwing rating -> pitch speed (1 -> 60mph, 10 -> 90mph) ----------
-const PITCH_SPEED_MPH = 60 + ((pitcherAttributes.throwing - 1) / 9) * (90 - 60); // linear interpolation
-const PITCH_SPEED = PITCH_SPEED_MPH * 1.467 * FT; // mph -> ft/s -> world units/s
+// ---------- Throwing rating -> ball speed (1 -> 60mph, 10 -> 90mph) ----------
+// Shared by pitches and fielder throws to first base.
+function throwingRatingToThrowSpeed(rating) {
+  const mph = 60 + ((rating - 1) / 9) * (90 - 60); // linear interpolation
+  return mph * 1.467 * FT; // mph -> ft/s -> world units/s
+}
 const PLATE_DEPTH = 1.4; // matches the home plate shape's depth, used for foul lines too
+const PITCH_HEIGHT_SPREAD = CAPSULE_TOTAL_HEIGHT * 0.4; // how far above/below the middle a pitch can arrive
 
 function throwPitch() {
   if (pitch.inFlight || pitch.resetting || inPlay.active) return;
+  showNameCards();
   swungThisPitch = false;
   pitch.inFlight = true;
   pitch.startPos.copy(ballMesh.position);
 
   // Travel through home plate and 4ft past the back of it (the plate's point/tip,
-  // which faces the backstop).
-  const dirToHome = new THREE.Vector3(HOME.x - pitch.startPos.x, 0, HOME.z - pitch.startPos.z).normalize();
+  // which faces the backstop). Pitches arrive at varying heights — up in the
+  // zone, down at the knees — instead of always on one flat plane.
+  const dirToHomeXZ = new THREE.Vector3(HOME.x - pitch.startPos.x, 0, HOME.z - pitch.startPos.z).normalize();
   const overshoot = PLATE_DEPTH + 4 * FT;
+  const targetHeight = ballHoldHeight + (Math.random() - 0.5) * 2 * PITCH_HEIGHT_SPREAD;
   const target = new THREE.Vector3(
-    HOME.x + dirToHome.x * overshoot,
-    ballHoldHeight,
-    HOME.z + dirToHome.z * overshoot
+    HOME.x + dirToHomeXZ.x * overshoot,
+    targetHeight,
+    HOME.z + dirToHomeXZ.z * overshoot
   );
 
-  pitch.velocity.copy(dirToHome).multiplyScalar(PITCH_SPEED);
+  const dir3D = new THREE.Vector3().subVectors(target, pitch.startPos).normalize();
+  pitch.velocity.copy(dir3D).multiplyScalar(throwingRatingToThrowSpeed(pitcherAttributes.throwing));
   pitch.target = target;
 }
 
@@ -957,7 +1603,17 @@ const followCam = {
 function updateCamera(dt) {
   let desiredPos, desiredLookAt, lerpSpeed;
 
-  if (inPlay.active) {
+  if (inPlay.homerunCalled) {
+    // Home run: follow the batter rounding the bases until they cross home.
+    desiredPos = new THREE.Vector3(
+      batterMesh.position.x,
+      batterMesh.position.y + 30 * FT,
+      batterMesh.position.z - 34 * FT
+    );
+    desiredLookAt = batterMesh.position;
+    lerpSpeed = 3;
+    followCam.mode = 'tracking';
+  } else if (inPlay.active) {
     const distFromHome = Math.hypot(ballMesh.position.x - HOME.x, ballMesh.position.z - HOME.z);
 
     if (followCam.mode === 'tracking' && distFromHome > INFIELD_RADIUS) {
@@ -1029,6 +1685,15 @@ function animate() {
       pitch.inFlight = false;
       pitch.resetting = true;
       showPitchCall(swungThisPitch ? 'Strike!' : 'Ball!');
+      if (swungThisPitch) {
+        gameState.strikes++;
+        if (gameState.strikes >= 3) recordOut(); // strikeout
+        else updateScoreBug();
+      } else {
+        gameState.balls++;
+        if (gameState.balls >= 4) recordWalk(); // walk, no out
+        else updateScoreBug();
+      }
       // Pause for 3 seconds at the stopping point, then reset to the pitcher's hand
       setTimeout(() => {
         ballMesh.position.set(
@@ -1043,6 +1708,8 @@ function animate() {
 
   updateRunner(dt);
   updateBallInPlay(dt);
+  updateFielders(dt);
+  updateBallReturn(dt);
   updateCamera(dt);
   updateNameCards();
 
