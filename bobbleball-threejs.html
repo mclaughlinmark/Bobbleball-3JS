@@ -763,6 +763,41 @@ function makeRunnerMarker() {
 // Orange markers showing which bases are currently occupied.
 const baseRunnerMeshes = { first: makeRunnerMarker(), second: makeRunnerMarker(), third: makeRunnerMarker() };
 
+// ---------- Base runner reads: lead off, advance, or tag up on a live ball ----------
+// While a ball is in play, runners on base react like real baserunners: on a
+// ball still in the air they stray partway toward the next base, ready to go
+// either way; the instant it touches the ground (or the wall) they take off
+// for the next base; and if a fly is caught they hustle back to their bag.
+// The box-score result (how far everyone actually advances) is still decided
+// at resolution — this drives the markers' movement in between.
+const NEXT_BASE_POS = { first: SECOND, second: THIRD, third: HOME };
+const runnerAnim = { t: 0 }; // 0 = standing on the bag, 1 = arrived at the next base
+const RUNNER_LEAD_FRACTION = 0.3; // how far toward the next base they stray while the ball's in the air
+const RUNNER_ANIM_RATE = 0.5;     // fraction of a basepath leg covered per second
+
+function updateBaseRunnerAnim(dt) {
+  const live = inPlay.active && !inPlay.resolved;
+  // With two outs there's no reason to hedge: a caught ball ends the inning
+  // anyway, so every runner takes off for the next base on contact.
+  const target = !live ? 0 // play over (caught fly / out / between pitches): back to the bag
+    : (gameState.outs >= 2 || inPlay.touchedGround || inPlay.touchedFence) ? 1 // run!
+    : RUNNER_LEAD_FRACTION; // ball in the air, fewer than two outs: edge off the bag
+  runnerAnim.t += clamp(target - runnerAnim.t, -RUNNER_ANIM_RATE * dt, RUNNER_ANIM_RATE * dt);
+  // Position every visible marker each frame (even at t = 0, on the bag) so a
+  // mid-play occupancy sync can never snap a leading runner around visibly.
+  for (const key of BASE_ORDER) {
+    const mesh = baseRunnerMeshes[key];
+    if (!mesh.visible) continue;
+    const from = BASE_WORLD_POS[key];
+    const to = NEXT_BASE_POS[key];
+    mesh.position.set(
+      from.x + (to.x - from.x) * runnerAnim.t,
+      standHeight,
+      from.z + (to.z - from.z) * runnerAnim.t
+    );
+  }
+}
+
 function syncBaseRunnerMeshes() {
   for (const key of BASE_ORDER) {
     const occupant = gameState.bases[key];
@@ -780,6 +815,7 @@ function syncBaseRunnerMeshes() {
 
 function clearBases() {
   gameState.bases = { first: null, second: null, third: null };
+  runnerAnim.t = 0;
   syncBaseRunnerMeshes();
 }
 
@@ -802,6 +838,23 @@ function advanceRunnersForHit(bases, batterAttrs) {
   });
   placeAtBaseIndex(newBases, bases, batterAttrs);
   gameState.bases = newBases;
+  runnerAnim.t = 0; // occupancy changed: markers restart from their new bags
+  syncBaseRunnerMeshes();
+}
+
+// On a ground-ball out at first, the other runners were already running when
+// the ball was on the ground — they keep the next base instead of returning.
+// Rulebook-style exception: if the out at first is the third out, the inning is
+// over and nobody advances or scores.
+function advanceRunnersOnGroundOut() {
+  if (gameState.outs >= 2) return; // this out ends the inning
+  const newBases = { first: null, second: null, third: null };
+  BASE_ORDER.forEach((baseKey, i) => {
+    const occupant = gameState.bases[baseKey];
+    if (occupant) placeAtBaseIndex(newBases, (i + 1) + 1, occupant); // one base ahead; third scores
+  });
+  gameState.bases = newBases;
+  runnerAnim.t = 0; // occupancy changed: markers restart from their new bags
   syncBaseRunnerMeshes();
 }
 
@@ -817,6 +870,7 @@ function advanceRunnersForWalk(batterAttrs) {
     gameState.bases.second = gameState.bases.first;
   }
   gameState.bases.first = batterAttrs;
+  runnerAnim.t = 0; // occupancy changed: markers restart from their new bags
   syncBaseRunnerMeshes();
 }
 
@@ -1467,6 +1521,7 @@ function onThrowReachedFirst() {
   if (throwToFirst.out) {
     runner.active = false; // thrown out before reaching the bag
     showPitchCall('Out!');
+    advanceRunnersOnGroundOut(); // runners already running on the ground ball hold the next base
     recordOut();
   } else {
     // The runner beat the throw; he stays put on first for a single.
@@ -1517,7 +1572,28 @@ function fieldBall(fielder, caught) {
   sendRunnerToBase(bases);
   showPitchCall(bases === 1 ? 'Single!' : bases === 2 ? 'Double!' : 'Triple!');
   recordHit(bases);
+  startHitBallReturn(fielder);
   scheduleResetAfterPlay(3000);
+}
+
+// After a base hit is fielded in the outfield, the ball still has to come back
+// in: the fielder throws to the nearest infielder, who pauses a beat and then
+// throws it back to the pitcher.
+function startHitBallReturn(fielder) {
+  const waypoints = [];
+  let relayFielder = null;
+  if (OUTFIELD_POSITIONS.includes(fielder.posKey)) {
+    relayFielder = INFIELD_KEYS.map(fielderByPos).reduce((a, b) =>
+      a.mesh.position.distanceTo(fielder.mesh.position) <= b.mesh.position.distanceTo(fielder.mesh.position) ? a : b);
+    // Freeze the relay man where he stands right now — the throw is aimed there.
+    waypoints.push(new THREE.Vector3(relayFielder.mesh.position.x, ballHoldHeight, relayFielder.mesh.position.z));
+  }
+  waypoints.push(pitcherHandPos());
+  ballReturn.waypoints = waypoints;
+  ballReturn.speed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
+  ballReturn.pause = 0;
+  ballReturn.relayFielder = relayFielder;
+  ballReturn.active = true;
 }
 
 // Keeps a point from crossing to the far side of any outfield fence segment —
@@ -1867,6 +1943,7 @@ function animate() {
   updateRunner(dt);
   updateBallInPlay(dt);
   updateFielders(dt);
+  updateBaseRunnerAnim(dt);
   updateThrowToFirst(dt);
   updateBallReturn(dt);
   updateCamera(dt);
