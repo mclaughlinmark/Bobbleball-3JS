@@ -120,10 +120,34 @@ homeDirt.position.set(HOME.x, 0.015, HOME.z);
 homeDirt.receiveShadow = true;
 scene.add(homeDirt);
 
+// First and third base sit entirely in fair territory: the foul line runs along
+// the bag's outside edge, not through its middle. Nudge each bag inward,
+// perpendicular to its foul line, by half its width plus half the chalk line.
+const BASE_SIZE = 1.3;
+const FOUL_LINE_WIDTH = 0.15; // matches the foul line geometry below
+const bagInset = BASE_SIZE / 2 + FOUL_LINE_WIDTH / 2;
+// Inward (fair-side) directions, perpendicular to each foul line.
+const FIRST_BAG_POS = FIRST.clone().addScaledVector(new THREE.Vector3(1, 0, 1).normalize(), bagInset);
+const THIRD_BAG_POS = THIRD.clone().addScaledVector(new THREE.Vector3(-1, 0, 1).normalize(), bagInset);
+
+// Where the first baseman stands to take a throw: on the inside of the bag
+// (the side facing second base), his body barely touching the bag's inner
+// edge — a foot on the base for the out. The throw comes to rest here (in his
+// glove), not at the base itself.
+const FIRST_COVER_POS = (() => {
+  const towardSecond = SECOND.clone().sub(FIRST_BAG_POS); // inside of the bag, toward second
+  towardSecond.y = 0;
+  towardSecond.normalize();
+  // The capsule tapers to a point at the ground, so at bag height its silhouette
+  // is only ~0.31 wide (vs 0.53 at the waist). Stand close enough that the foot
+  // of the capsule visibly overlaps the bag edge, not just the rounded belly.
+  return FIRST_BAG_POS.clone().addScaledVector(towardSecond, BASE_SIZE / 2 + 0.15);
+})();
+
 makeBase(HOME, true);
-makeBase(FIRST, false, Math.PI / 4);
+makeBase(FIRST_BAG_POS, false, Math.PI / 4);
 makeBase(SECOND, false, Math.PI / 4);
-makeBase(THIRD, false, Math.PI / 4);
+makeBase(THIRD_BAG_POS, false, Math.PI / 4);
 
 // ---------- Pitcher's mound (dirt circle at the center of the diamond) ----------
 const moundCenter = new THREE.Vector3(
@@ -153,47 +177,77 @@ scene.add(rubber);
 
 // (base labels removed per request)
 
-// ---------- Batter's boxes (chalk outlines, both sides of home plate) ----------
+// ---------- Batter's boxes & foul lines (chalk, both drawn at the same width) ----------
+const CHALK_WIDTH = FOUL_LINE_WIDTH; // 0.15 — boxes and foul lines share one line width
+const PLATE_TIP_DEPTH = 1.4;         // home plate's back point, where the foul lines originate
+const chalkMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
+
+// A single chalk bar laid on the dirt between two ground points (x,z).
+function makeChalkSegment(x1, z1, x2, z2, y = 0.03) {
+  const from = new THREE.Vector3(x1, 0, z1);
+  const to = new THREE.Vector3(x2, 0, z2);
+  const length = from.distanceTo(to);
+  const dir = new THREE.Vector3().subVectors(to, from).normalize();
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(CHALK_WIDTH, 0.04, length), chalkMat);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+  mesh.position.copy(from).addScaledVector(dir, length / 2);
+  mesh.position.y = y;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+
+// Batter's box footprint (shared by the box outline and the foul-line clipping).
+const BOX_WIDTH = 1.2;   // ~4ft
+const BOX_LENGTH = 1.8;  // ~6ft
+const BOX_GAP = 0.85;    // plate center to the box's inner edge
+function batterBoxBounds(xSign) {
+  const cx = HOME.x + xSign * (BOX_GAP + BOX_WIDTH / 2);
+  const cz = HOME.z - BOX_LENGTH * 0.15;
+  return { xmin: cx - BOX_WIDTH / 2, xmax: cx + BOX_WIDTH / 2, zmin: cz - BOX_LENGTH / 2, zmax: cz + BOX_LENGTH / 2 };
+}
+
+// Draw a batter's box as four chalk bars. The two long sides run past the corners
+// by half a line width so they fill the corner squares — otherwise the outer corner
+// (which neither a side nor a cap bar reaches) is left notched out.
 function makeBatterBox(xSign) {
-  const boxWidth = 1.2;   // ~4ft
-  const boxLength = 1.8;  // ~6ft
-  const gap = 0.85;       // gap from plate center to inner edge of box
-  const geo = new THREE.PlaneGeometry(boxWidth, boxLength);
-  const edges = new THREE.EdgesGeometry(geo);
-  const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff }));
-  line.rotation.x = -Math.PI / 2;
-  // Centered to the side of the plate, straddling home plate front-to-back
-  line.position.set(HOME.x + xSign * (gap + boxWidth / 2), 0.05, HOME.z - boxLength * 0.15);
-  scene.add(line);
+  const b = batterBoxBounds(xSign);
+  const h = CHALK_WIDTH / 2;
+  makeChalkSegment(b.xmin, b.zmin - h, b.xmin, b.zmax + h); // long sides, extended to square off the corners
+  makeChalkSegment(b.xmax, b.zmin - h, b.xmax, b.zmax + h);
+  makeChalkSegment(b.xmin, b.zmin, b.xmax, b.zmin);         // front/back caps tuck between the sides
+  makeChalkSegment(b.xmin, b.zmax, b.xmax, b.zmax);
 }
 makeBatterBox(1);   // right-handed batter's box
 makeBatterBox(-1);  // left-handed batter's box
 
-// ---------- Foul lines (chalk, home through 1B and 3B out to the field edge) ----------
+// Foul lines run from where they exit the batter's box out to the outfield fence —
+// so each line visibly starts at the box (no chalk between the plate and the boxes)
+// and stops at the wall rather than shooting off to infinity.
+// Called after the fence is built so its segments are available to clip against.
 function makeFoulLine(throughBase, cornerSign) {
-  // Home plate's point (the back tip, facing the backstop) is where the foul
-  // lines actually originate — not the flat front edge.
-  const plateDepth = 1.4;
-  const tip = new THREE.Vector3(HOME.x, 0, HOME.z - plateDepth);
-
+  const tip = new THREE.Vector3(HOME.x, 0, HOME.z - PLATE_TIP_DEPTH);
   const dir = new THREE.Vector3().subVectors(throughBase, tip).normalize();
-  const length = FIELD_SIZE * 1.15; // run from the plate's tip past the base to the field edge
-  const geo = new THREE.BoxGeometry(0.15, 0.04, length);
-  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
-  const mesh = new THREE.Mesh(geo, mat);
-
-  // Default box length axis is local +Z. Rotate it to point along `dir`.
-  const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
-  mesh.quaternion.copy(quat);
-
-  mesh.position.copy(tip).addScaledVector(dir, length / 2);
+  // Slab method: the larger of each axis pair is where the ray leaves that slab; the
+  // smaller of those two is where it leaves the box — the line's inner (home-side) end.
+  const b = batterBoxBounds(cornerSign);
+  const tExitX = Math.max((b.xmin - tip.x) / dir.x, (b.xmax - tip.x) / dir.x);
+  const tExitZ = Math.max((b.zmin - tip.z) / dir.z, (b.zmax - tip.z) / dir.z);
+  const tStart = Math.min(tExitX, tExitZ);
+  // Outer end: where the foul ray meets the fence (nearest crossing), else the field edge.
+  const far = new THREE.Vector3().copy(tip).addScaledVector(dir, FIELD_SIZE * 2);
+  let tEnd = FIELD_SIZE * 1.15;
+  for (const seg of fenceSegments) {
+    const hit = segmentIntersect2D(tip, far, seg.start, seg.end);
+    if (hit) tEnd = Math.min(tEnd, tip.distanceTo(hit.point));
+  }
+  const length = tEnd - tStart;
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(CHALK_WIDTH, 0.04, length), chalkMat);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+  mesh.position.copy(tip).addScaledVector(dir, tStart + length / 2);
   mesh.position.y = 0.03;
   mesh.receiveShadow = true;
   scene.add(mesh);
 }
-// FIRST sits on the negative-x side, THIRD on the positive-x side.
-makeFoulLine(FIRST, -1);
-makeFoulLine(THIRD, 1);
 
 // ---------- Dirt circles around 1B, 2B, and 3B (same size as the pitcher's mound) ----------
 function makeBaseDirtCircle(basePos) {
@@ -206,9 +260,9 @@ function makeBaseDirtCircle(basePos) {
   circle.receiveShadow = true;
   scene.add(circle);
 }
-makeBaseDirtCircle(FIRST);
+makeBaseDirtCircle(FIRST_BAG_POS);
 makeBaseDirtCircle(SECOND);
-makeBaseDirtCircle(THIRD);
+makeBaseDirtCircle(THIRD_BAG_POS);
 
 // Collision data for all outfield fence segments (filled in below)
 const fenceSegments = [];
@@ -360,6 +414,11 @@ const fenceSegments = [];
     scene.add(post);
   }
 }
+
+// Now that the fence exists, draw the foul lines (they clip against it).
+// FIRST sits on the negative-x side, THIRD on the positive-x side.
+makeFoulLine(FIRST, -1);
+makeFoulLine(THIRD, 1);
 
 // ---------- Player: pitcher (pill/capsule shape, white) on the mound ----------
 const PLAYER_RADIUS = 1.05 * 0.5;
@@ -590,7 +649,7 @@ const BASE_WORLD_POS = { first: FIRST, second: SECOND, third: THIRD };
 function makeRunnerMarker() {
   const mesh = new THREE.Mesh(
     new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT, 8, 16),
-    new THREE.MeshStandardMaterial({ color: 0xffa500, roughness: 0.55 })
+    new THREE.MeshStandardMaterial({ color: HOME_COLOR, roughness: 0.55 }) // recolored to the batting team in syncBaseRunnerMeshes()
   );
   mesh.visible = false;
   mesh.castShadow = true;
@@ -598,7 +657,7 @@ function makeRunnerMarker() {
   scene.add(mesh);
   return mesh;
 }
-// Orange markers showing which bases are currently occupied.
+// Markers showing which bases are currently occupied, in the batting team's colors.
 const baseRunnerMeshes = { first: makeRunnerMarker(), second: makeRunnerMarker(), third: makeRunnerMarker() };
 
 // ---------- Base runner reads: lead off, advance, or tag up on a live ball ----------
@@ -609,18 +668,36 @@ const baseRunnerMeshes = { first: makeRunnerMarker(), second: makeRunnerMarker()
 // The box-score result (how far everyone actually advances) is still decided
 // at resolution — this drives the markers' movement in between.
 const NEXT_BASE_POS = { first: SECOND, second: THIRD, third: HOME };
-const runnerAnim = { t: 0 }; // 0 = standing on the bag, 1 = arrived at the next base
+// t: 0 = standing on the bag, 1 = arrived at the next base.
+// forcedAdvance: runners are completing a one-base advance (ground-ball out or
+// infield single); drive t to 1 then commit `pending` occupancy — so they run
+// all the way to the next base instead of teleporting there at the throw.
+const runnerAnim = { t: 0, forcedAdvance: false, pending: null };
 const RUNNER_LEAD_FRACTION = 0.3; // how far toward the next base they stray while the ball's in the air
 const RUNNER_ANIM_RATE = 0.5;     // fraction of a basepath leg covered per second
 
 function updateBaseRunnerAnim(dt) {
   if (inningTransition.phase !== 'none') return; // stranded runners are jogging off with the sides
-  const live = inPlay.active && !inPlay.resolved;
-  // With two outs there's no reason to hedge: a caught ball ends the inning
-  // anyway, so every runner takes off for the next base on contact.
-  const target = !live ? 0 // play over (caught fly / out / between pitches): back to the bag
-    : (gameState.outs >= 2 || inPlay.touchedGround || inPlay.touchedFence) ? 1 // run!
-    : RUNNER_LEAD_FRACTION; // ball in the air, fewer than two outs: edge off the bag
+  let target;
+  if (runnerAnim.forcedAdvance) {
+    target = 1; // finishing a deferred advance to the next base, then we commit occupancy
+  } else if (throwToFirst.active || groundPlay.active || firstBasePutout.active) {
+    // Infield grounder being fielded/thrown: the runners are committed and keep going
+    // toward the next base (never retreating) until the out/safe call resolves it.
+    target = 1;
+  } else if (!inPlay.active) {
+    target = 0; // between pitches: standing on the bag
+  } else if (inPlay.resolved) {
+    // The play's been called and occupancy is final (a hit was recorded, or a
+    // fly was caught): hold on the assigned bag — don't drift to the next base.
+    target = 0;
+  } else if (inPlay.touchedGround || inPlay.touchedFence) {
+    target = 1; // ball live and on the ground: runners advancing
+  } else if (gameState.outs >= 2) {
+    target = 1; // two outs: running on contact, even before the ball lands
+  } else {
+    target = RUNNER_LEAD_FRACTION; // ball in the air, fewer than two outs: edge off the bag
+  }
   runnerAnim.t += clamp(target - runnerAnim.t, -RUNNER_ANIM_RATE * dt, RUNNER_ANIM_RATE * dt);
   // Position every visible marker each frame (even at t = 0, on the bag) so a
   // mid-play occupancy sync can never snap a leading runner around visibly.
@@ -635,9 +712,54 @@ function updateBaseRunnerAnim(dt) {
       from.z + (to.z - from.z) * runnerAnim.t
     );
   }
+  // The runners have reached the next base — now commit the deferred occupancy,
+  // seamlessly (their markers are already sitting on the new bags at t = 1).
+  if (runnerAnim.forcedAdvance && runnerAnim.t >= 1) commitForcedAdvance();
+}
+
+// Existing base runners each advance one base (a runner from third scores);
+// `batterToFirst` also lands the batter on first (an infield single). Returns
+// the resulting occupancy without applying it.
+function runnersAdvancedOneBase(batterToFirst) {
+  const newBases = { first: null, second: null, third: null };
+  BASE_ORDER.forEach((baseKey, i) => {
+    const occupant = gameState.bases[baseKey];
+    if (occupant) placeAtBaseIndex(newBases, (i + 1) + 1, occupant); // one base ahead; third scores
+  });
+  if (batterToFirst) newBases.first = runner.attrs; // the batter, captured at contact
+  return newBases;
+}
+
+function anyRunnersOn() {
+  return !!(gameState.bases.first || gameState.bases.second || gameState.bases.third);
+}
+
+// Advance runners a base, animated. If runners are on, defer the occupancy change
+// until their markers finish running to the next base; otherwise apply at once.
+function beginRunnerAdvance(batterToFirst) {
+  const finalBases = runnersAdvancedOneBase(batterToFirst);
+  if (anyRunnersOn()) {
+    runnerAnim.pending = finalBases;
+    runnerAnim.forcedAdvance = true;
+  } else {
+    gameState.bases = finalBases;
+    runnerAnim.t = 0;
+    syncBaseRunnerMeshes();
+  }
+}
+
+function commitForcedAdvance() {
+  gameState.bases = runnerAnim.pending;
+  runnerAnim.pending = null;
+  runnerAnim.forcedAdvance = false;
+  runnerAnim.t = 0;
+  syncBaseRunnerMeshes();
+  updateScoreBug(); // a runner from third may have scored on the advance
 }
 
 function syncBaseRunnerMeshes() {
+  // Runners belong to whichever team is batting — wear their color.
+  const runnerColor = battingTeam() === teams.home ? HOME_COLOR : VISITOR_COLOR;
   for (const key of BASE_ORDER) {
     const occupant = gameState.bases[key];
     // While the batter's own sprite is still sprinting toward this base, let
@@ -648,6 +770,7 @@ function syncBaseRunnerMeshes() {
     if (occupied) {
       const pos = BASE_WORLD_POS[key];
       baseRunnerMeshes[key].position.set(pos.x, standHeight, pos.z);
+      baseRunnerMeshes[key].material.color.set(runnerColor);
     }
   }
 }
@@ -676,19 +799,12 @@ function advanceRunnersForHit(bases, batterAttrs) {
 }
 
 // On a ground-ball out at first, the other runners were already running when
-// the ball was on the ground — they keep the next base instead of returning.
-// Rulebook-style exception: if the out at first is the third out, the inning is
-// over and nobody advances or scores.
+// the ball was on the ground — they keep the next base instead of returning,
+// finishing the run there (not teleporting). Rulebook exception: if the out at
+// first is the third out, the inning is over and nobody advances or scores.
 function advanceRunnersOnGroundOut() {
   if (gameState.outs >= 2) return; // this out ends the inning
-  const newBases = { first: null, second: null, third: null };
-  BASE_ORDER.forEach((baseKey, i) => {
-    const occupant = gameState.bases[baseKey];
-    if (occupant) placeAtBaseIndex(newBases, (i + 1) + 1, occupant); // one base ahead; third scores
-  });
-  gameState.bases = newBases;
-  runnerAnim.t = 0; // occupancy changed: markers restart from their new bags
-  syncBaseRunnerMeshes();
+  if (anyRunnersOn()) beginRunnerAdvance(false);
 }
 
 // ---------- Inning transition: the sides hustle off and on between half-innings ----------
@@ -744,7 +860,14 @@ function startInningTransition() {
   ballReturn.active = false;
   ballReturn.waypoints = [];
   ballReturn.relayFielder = null;
+  ballReturn.thrower = null;
   throwToFirst.active = false;
+  groundPlay.active = false;
+  groundPlay.pauseLeft = 0;
+  firstBasePutout.active = false;
+  firstBasemanCharging = false;
+  pitcherCoveringFirst = false;
+  pitcherReturning = false;
 
   if (gameState.half === 'top') {
     gameState.half = 'bottom';
@@ -1033,16 +1156,20 @@ function buildBattedBall(playType) {
 function onBallHit(timingOffset, proximityQuality) {
   pitch.inFlight = false;
 
-  // Batter drops the bat and takes off running toward first base — the runner
-  // system extends this further (2nd/3rd/home) once the play is resolved.
-  batGroup.visible = false;
-  sendRunnerToBase(1);
-
   const quality = clamp(proximityQuality - Math.abs(timingOffset) * 0.6, 0, 1);
   const playType = rollPlayOutcome(quality);
   const { spray, angleDeg, speed } = buildBattedBall(playType);
   const launchAngle = angleDeg * (Math.PI / 180);
   const launchDir = sprayToDir(spray);
+
+  // Batter drops the bat and runs hard out of the box. The outcome is already
+  // rolled, so on an extra-base hit he heads straight for second/third (or all
+  // the way around on a homer) while the ball is still rolling, instead of
+  // waiting at first for the fielder to pick it up. On a called out he still
+  // runs out the grounder to first.
+  batGroup.visible = false;
+  const calledBases = PLAY_TYPE_BASES[playType] ?? 0;
+  sendRunnerToBase(Math.max(1, calledBases));
 
   inPlay.active = true;
   inPlay.resting = false;
@@ -1050,7 +1177,7 @@ function onBallHit(timingOffset, proximityQuality) {
   inPlay.touchedFence = false;
   inPlay.homerunCalled = false;
   inPlay.resolved = false;
-  inPlay.calledBases = PLAY_TYPE_BASES[playType] ?? 0;
+  inPlay.calledBases = calledBases;
   hitClock = 0;
   inPlay.velocity.set(
     launchDir.x * speed * Math.cos(launchAngle),
@@ -1178,6 +1305,11 @@ function updateNameCards() {
 }
 
 function resetPitchToPitcher() {
+  if (runnerAnim.forcedAdvance) commitForcedAdvance(); // safety: settle any in-progress advance
+  firstBasemanCharging = false; // fresh pitch: the first baseman starts back at his position
+  pitcherCoveringFirst = false;
+  pitcherReturning = false;
+  pitcherMesh.position.copy(PITCHER_HOME); // snap the pitcher back to the mound if he'd gone to cover
   ballMesh.position.set(
     pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
     ballHoldHeight,
@@ -1256,7 +1388,7 @@ function showPitchCall(message) {
 function scheduleResetAfterPlay(minDelayMs) {
   const startedAt = Date.now();
   (function poll() {
-    if (!runner.active && !ballReturn.active && !throwToFirst.active && Date.now() - startedAt >= minDelayMs) {
+    if (!runner.active && !ballReturn.active && !throwToFirst.active && !groundPlay.active && !firstBasePutout.active && !pitcherReturning && !runnerAnim.forcedAdvance && Date.now() - startedAt >= minDelayMs) {
       resetPitchToPitcher();
     } else {
       setTimeout(poll, 200);
@@ -1276,7 +1408,9 @@ function checkHomeRun() {
       // Ball cleared the fence in the air, without ever touching the ground — home run!
       inPlay.homerunCalled = true;
       inPlay.resolved = true;
-      sendRunnerToBase(4);
+      // A called homer's batter has been rounding the bases since contact;
+      // re-sending would restart his waypoints and make him double back.
+      if (inPlay.calledBases !== 4) sendRunnerToBase(4);
       recordHomeRun();
       triggerHomeRun();
       scheduleResetAfterPlay(3000);
@@ -1372,8 +1506,24 @@ const ballReturn = {
   speed: 0,
   pause: 0, // seconds the ball waits in the cutoff man's glove before the relay throw
   relayFielder: null, // cutoff man to hold in place until he's relayed the ball on
+  thrower: null, // the fielder holding the ball through an initial pause — stays put until his throw is away
+  onDone: null, // optional callback fired once the ball reaches the pitcher
 };
 const RELAY_PAUSE = 0.5; // beat between the cutoff man catching it and throwing to the pitcher
+
+// The catcher throws a called ball/strike back to the pitcher (the ball is
+// sitting where the pitch ended up, near the plate). Clears pitch.resetting
+// when it lands, freeing the next pitch.
+function startCatcherReturn() {
+  if (inningTransition.phase !== 'none') { pitch.resetting = false; return; }
+  ballReturn.waypoints = [pitcherHandPos()];
+  ballReturn.speed = throwingRatingToThrowSpeed(fielderByPos('C').attrs.throwing);
+  ballReturn.pause = 0;
+  ballReturn.relayFielder = null;
+  ballReturn.thrower = null;
+  ballReturn.onDone = () => { pitch.resetting = false; };
+  ballReturn.active = true;
+}
 
 function pitcherHandPos() {
   return new THREE.Vector3(
@@ -1383,7 +1533,7 @@ function pitcherHandPos() {
   );
 }
 
-function startBallReturn(fielder) {
+function startBallReturn(fielder, initialPause = 0) {
   if (inningTransition.phase !== 'none') return; // side retired: the ball leaves with the teams
   const waypoints = [];
   let relayFielder = null;
@@ -1395,16 +1545,23 @@ function startBallReturn(fielder) {
   waypoints.push(pitcherHandPos()); // infield catch: toss it straight back to the pitcher
   ballReturn.waypoints = waypoints;
   ballReturn.speed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
-  ballReturn.pause = 0;
+  ballReturn.pause = initialPause; // beat the fielder holds it before the throw back in
   ballReturn.relayFielder = relayFielder; // held in place until the relay is away
+  ballReturn.thrower = initialPause > 0 ? fielder : null; // holds his spot while holding the ball
+  ballReturn.onDone = null;
   ballReturn.active = true;
+}
+
+function basesEmpty() {
+  return !gameState.bases.first && !gameState.bases.second && !gameState.bases.third;
 }
 
 function updateBallReturn(dt) {
   if (!ballReturn.active || ballReturn.waypoints.length === 0) return;
-  // The cutoff man holds the ball a beat before relaying it on to the pitcher.
+  // Whoever has the ball holds it (and his spot) a beat before throwing on.
   if (ballReturn.pause > 0) {
     ballReturn.pause -= dt;
+    if (ballReturn.pause <= 0) ballReturn.thrower = null; // throw is away — he can jog home now
     return;
   }
   const target = ballReturn.waypoints[0];
@@ -1416,6 +1573,9 @@ function updateBallReturn(dt) {
     if (ballReturn.waypoints.length === 0) {
       ballReturn.active = false;
       ballReturn.relayFielder = null;
+      const done = ballReturn.onDone;
+      ballReturn.onDone = null;
+      if (done) done();
     } else {
       // Reached a relay point (the cutoff man) — pause before the next throw.
       ballReturn.pause = RELAY_PAUSE;
@@ -1442,20 +1602,34 @@ function runnerReachesFirstTime() {
   return speedRatingToTimeToFirst(batterAttributes.speed);
 }
 
+// The spot the throw to first is aimed at: the pitcher's cover spot if he's covering
+// (the first baseman charged the ball), otherwise the first baseman's cover spot.
+function firstBaseThrowTarget() {
+  return pitcherCoveringFirst ? PITCHER_FIRST_COVER : FIRST_COVER_POS;
+}
+
 // Launches the fielded ball on a throw to first base and locks in whether it beats
-// the runner. The first baseman is already covering first (see updateFielders).
+// the runner. Whoever's covering first (first baseman, or pitcher if the first
+// baseman charged the ball) is already breaking for the bag (see updateFielders).
 function startThrowToFirst(fielder) {
   const throwSpeed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
-  const throwTime = fielder.mesh.position.distanceTo(FIRST) / throwSpeed;
+  const throwTime = fielder.mesh.position.distanceTo(firstBaseThrowTarget()) / throwSpeed;
   const defenseTime = hitClock + throwTime;      // whole clock: contact -> field -> ball at first
   throwToFirst.out = defenseTime < runnerReachesFirstTime();
   throwToFirst.speed = throwSpeed;
   throwToFirst.active = true;
 }
 
+// A fielder must be within this of the cover spot to be "on the bag" for a putout.
+const BAG_COVER_RADIUS = 1.3;
+
 function updateThrowToFirst(dt) {
   if (!throwToFirst.active) return;
-  const target = new THREE.Vector3(FIRST.x, ballHoldHeight, FIRST.z);
+  // Aim at the cover spot (the bag), not a fielder's live position — a throw only
+  // records an out if it comes to the base and someone's there to catch it on the
+  // bag. The covering fielder is the pitcher when the first baseman charged the ball.
+  const coverPos = firstBaseThrowTarget();
+  const target = new THREE.Vector3(coverPos.x, ballHoldHeight, coverPos.z);
   const dir = new THREE.Vector3().subVectors(target, ballMesh.position);
   const dist = dir.length();
   if (dist < 0.3) {
@@ -1470,24 +1644,322 @@ function updateThrowToFirst(dt) {
 
 // The throw has arrived at first base — call the play.
 function onThrowReachedFirst() {
-  if (throwToFirst.out) {
+  // An out requires whoever's covering first to actually be on the bag to receive it.
+  // Normally that's the first baseman; if he charged the ball, the pitcher covers.
+  // If nobody made it to the bag, the batter is safe no matter the throw-vs-runner race.
+  const firstBaseman = fielderByPos('1B');
+  const caughtByPitcher = pitcherCoveringFirst;
+  const onBag = caughtByPitcher
+    ? pitcherOnFirst()
+    : (firstBaseman && Math.hypot(firstBaseman.mesh.position.x - FIRST_COVER_POS.x,
+                                  firstBaseman.mesh.position.z - FIRST_COVER_POS.z) < BAG_COVER_RADIUS);
+  if (throwToFirst.out && onBag) {
     runner.active = false; // thrown out before reaching the bag
     showPitchCall('Out!');
-    advanceRunnersOnGroundOut(); // runners already running on the ground ball hold the next base
+    advanceRunnersOnGroundOut(); // runners already running on the ground ball finish the run
     recordOut();
   } else {
-    // The runner beat the throw; he stays put on first for a single.
+    // The runner beat the throw (or nobody covered) for an infield single. Existing
+    // runners finish running to the next base (animated); the batter is safe at first.
     showPitchCall('Safe!');
-    recordHit(1);
+    if (anyRunnersOn()) {
+      beginRunnerAdvance(true); // existing runners +1, batter to first — committed on arrival
+      advanceBatter();
+      endAtBat();
+    } else {
+      recordHit(1); // no one on: normal placement, the batter's sprite shows him reaching first
+    }
   }
-  // First baseman has the ball — after a beat, he throws it back to the pitcher.
-  // (Unless that out retired the side — then the ball leaves with the teams.)
+  // Get the ball back to the mound. (Unless that out retired the side — then the ball
+  // leaves with the teams.)
   if (inningTransition.phase === 'none') {
-    const firstBaseman = fielderByPos('1B');
+    if (caughtByPitcher) {
+      pitcherReturning = true; // the pitcher has it at first — he jogs it back to the mound himself
+    } else {
+      // First baseman holds the bag a half-second beat, then throws it back to the pitcher.
+      ballReturn.waypoints = [pitcherHandPos()];
+      ballReturn.speed = throwingRatingToThrowSpeed(firstBaseman.attrs.throwing);
+      ballReturn.pause = RELAY_PAUSE;
+      ballReturn.relayFielder = null;
+      ballReturn.thrower = firstBaseman; // holds the bag through the beat, released once his throw is away
+      ballReturn.onDone = null;
+      ballReturn.active = true;
+    }
+  }
+  scheduleResetAfterPlay(1500);
+}
+
+// ---------- Force plays & double plays ----------
+// With a runner on first, the batter forces everyone ahead of him: the infielder
+// goes after the LEAD runner (the force out is easier — the base is thrown to, the
+// runner doesn't have to be tagged) and then tries to relay across to first to turn
+// two. The lead force base is the top of the consecutive chain of runners starting
+// at first: runner on first alone -> force at second; first & second -> third; bases
+// loaded -> home. A gap breaks the chain (nobody behind the gap is forced).
+const NATURAL_COVER = { second: '2B', third: '3B', home: 'C' }; // who normally covers each force base
+const FORCE_FROM = { second: 'first', third: 'second', home: 'third' }; // the runner being forced to each base
+const COVER_CANDIDATES = { first: ['1B'], second: ['2B', 'SS'], third: ['3B', 'SS'], home: ['C'] };
+const DP_PIVOT_PAUSE = 0.4; // beat at the lead base to show the force before the relay to first
+
+// Cover standing spot for a bag: foot barely on it, on the infield (mound) side,
+// facing the incoming throw — same "just touching the bag" look as first base.
+function coverPosForBag(bagPos) {
+  const toward = new THREE.Vector3().subVectors(moundCenter, bagPos);
+  toward.y = 0;
+  toward.normalize();
+  return bagPos.clone().addScaledVector(toward, BASE_SIZE / 2 + 0.15);
+}
+const COVER_POS_BY_BASE = {
+  first: FIRST_COVER_POS,
+  second: coverPosForBag(SECOND),
+  third: coverPosForBag(THIRD_BAG_POS),
+  home: coverPosForBag(HOME),
+};
+
+// ---------- Pitcher covers first ----------
+// When the first baseman charges a grounder in his zone he's pulled off the bag, so
+// the pitcher sprints over to cover first and take the throw (a 3-1 / 4-3 putout).
+const PITCHER_FIRST_COVER = coverPosForBag(FIRST_BAG_POS); // touches the bag from the infield side
+const PITCHER_COVER_SPEED = fielderRatingToChaseSpeed(10) * 1.4; // he hustles to beat the throw over
+let pitcherCoveringFirst = false; // the pitcher is covering first this play (the 1B is off the bag)
+let pitcherReturning = false;     // he took the throw and is carrying the ball back to the mound
+
+// On the bag = horizontal (ground-plane) distance to the cover spot; the player's
+// standing height must not count against him.
+function pitcherOnFirst() {
+  return Math.hypot(pitcherMesh.position.x - PITCHER_FIRST_COVER.x,
+                    pitcherMesh.position.z - PITCHER_FIRST_COVER.z) < BAG_COVER_RADIUS;
+}
+
+const MOUND_RISE = 0.4; // the pitcher stands this much higher on the mound than on flat ground
+
+function updatePitcherCover(dt) {
+  if (inningTransition.phase !== 'none') return; // the transition owns the pitcher's movement
+  const covering = pitcherCoveringFirst && !pitcherReturning;
+  const targetXZ = covering ? PITCHER_FIRST_COVER : PITCHER_HOME;
+  const targetY = covering ? standHeight : standHeight + MOUND_RISE; // grounded at first, raised on the mound
+  const to = new THREE.Vector3(targetXZ.x, pitcherMesh.position.y, targetXZ.z);
+  const d = new THREE.Vector3().subVectors(to, pitcherMesh.position);
+  const dist = d.length();
+  if (dist > 0.05) {
+    d.normalize();
+    pitcherMesh.position.addScaledVector(d, Math.min(PITCHER_COVER_SPEED * dt, dist));
+  }
+  pitcherMesh.position.y += clamp(targetY - pitcherMesh.position.y, -2 * dt, 2 * dt); // ease on/off the mound
+  if (pitcherReturning) {
+    ballMesh.position.set(pitcherMesh.position.x, ballHoldHeight, pitcherMesh.position.z); // carries it back
+    if (dist < 0.1) pitcherReturning = false; // back on the mound with the ball
+  }
+}
+
+// The base the lead force out is made at, or null when nobody ahead of the batter
+// is forced (first base open) — then it's an ordinary throw across to first.
+function leadForceBase() {
+  const b = gameState.bases;
+  if (!b.first) return null;
+  if (!b.second) return 'second';
+  if (!b.third) return 'third';
+  return 'home';
+}
+
+// The fielder who covers a base, avoiding the one who fielded the ball (his middle-
+// infield partner takes it instead). Returns null if only the fielder could cover.
+function baseCoverFielder(baseKey, fielder) {
+  const key = COVER_CANDIDATES[baseKey].find(k => k !== fielder.posKey);
+  return key ? fielderByPos(key) : null;
+}
+
+// A chain of throws racing runners to force bases: hop 0 is the lead force, an
+// optional hop 1 is the relay to first to turn a double play. Each hop's out/safe
+// is pre-decided (like throwToFirst) from the throw times vs the runners' times.
+const groundPlay = {
+  active: false,
+  hops: [],      // { baseKey, cover, out, runnerAttrs, isBatter }
+  index: 0,
+  speed: 0,      // speed of the throw currently in flight
+  pauseLeft: 0,  // pivot beat between catching at the lead base and relaying on
+};
+
+function startGroundForcePlay(fielder) {
+  const leadBase = leadForceBase();
+  const leadCover = baseCoverFielder(leadBase, fielder);
+  const throwSpeed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
+  const leadCoverPos = COVER_POS_BY_BASE[leadBase];
+  const tLead = hitClock + fielder.mesh.position.distanceTo(leadCoverPos) / throwSpeed;
+  const leadRunner = gameState.bases[FORCE_FROM[leadBase]];
+  const leadOut = tLead < speedRatingToTimeToFirst(leadRunner.speed); // lead runner covers one base (60ft)
+
+  // Couldn't beat the lead runner to the bag (or nobody's free to cover it): abandon
+  // the force and just throw across to first for the batter — an ordinary fielder's choice.
+  if (!leadOut || !leadCover) { startThrowToFirst(fielder); return; }
+
+  const hops = [{ baseKey: leadBase, cover: leadCover, out: true, runnerAttrs: leadRunner, isBatter: false }];
+
+  // Try to turn two: the pivot man at the lead base relays across to first, racing
+  // the batter. Skipped with two outs already (the lead force ends the inning) or if
+  // the first baseman himself fielded the ball (nobody left to take the bag there).
+  const firstCover = baseCoverFielder('first', fielder);
+  if (gameState.outs <= 1 && firstCover && firstCover !== leadCover) {
+    const relaySpeed = throwingRatingToThrowSpeed(leadCover.attrs.throwing);
+    const tFirst = tLead + DP_PIVOT_PAUSE + leadCoverPos.distanceTo(FIRST_COVER_POS) / relaySpeed;
+    const firstOut = tFirst < runnerReachesFirstTime();
+    hops.push({ baseKey: 'first', cover: firstCover, out: firstOut, runnerAttrs: runner.attrs, isBatter: true });
+  }
+
+  groundPlay.hops = hops;
+  groundPlay.index = 0;
+  groundPlay.speed = throwSpeed; // the fielder's throw into the lead base
+  groundPlay.pauseLeft = 0;
+  groundPlay.active = true;
+}
+
+function updateGroundPlay(dt) {
+  if (!groundPlay.active) return;
+  const hop = groundPlay.hops[groundPlay.index];
+  const glove = hop.cover.mesh.position;
+  if (groundPlay.pauseLeft > 0) {
+    // Ball held in the pivot man's glove — glue it to him as he settles onto the bag.
+    ballMesh.position.set(glove.x, ballHoldHeight, glove.z);
+    groundPlay.pauseLeft -= dt;
+    if (groundPlay.pauseLeft <= 0) {
+      groundPlay.index++;
+      groundPlay.speed = throwingRatingToThrowSpeed(hop.cover.attrs.throwing); // pivot man's relay
+    }
+    return;
+  }
+  // Aim at the cover fielder's glove (his live position), so a still-arriving cover
+  // man is thrown to wherever he is, not to an empty bag.
+  const target = new THREE.Vector3(glove.x, ballHoldHeight, glove.z);
+  const dir = new THREE.Vector3().subVectors(target, ballMesh.position);
+  const dist = dir.length();
+  if (dist < 0.3) {
+    ballMesh.position.copy(target);
+    if (groundPlay.index >= groundPlay.hops.length - 1) resolveGroundPlay();
+    else groundPlay.pauseLeft = DP_PIVOT_PAUSE; // caught the force — show it, then relay to first
+    return;
+  }
+  dir.normalize();
+  ballMesh.position.addScaledVector(dir, Math.min(groundPlay.speed * dt, dist));
+}
+
+// The throws are done — total up the outs, advance the survivors, and post the call.
+function resolveGroundPlay() {
+  groundPlay.active = false;
+  const outHops = groundPlay.hops.filter(h => h.out);
+  const numOuts = outHops.length;
+  const outRunners = new Set(outHops.map(h => h.runnerAttrs));
+  const batterOut = groundPlay.hops.some(h => h.isBatter && h.out);
+
+  // Everyone was running on the grounder, so each existing runner advances a base and
+  // the batter heads to first; then remove whoever was forced/thrown out. A runner put
+  // out never reaches his base (and a lead runner forced at home never scores).
+  const advances = [];
+  BASE_ORDER.forEach((k, i) => { const occ = gameState.bases[k]; if (occ) advances.push({ attrs: occ, dest: (i + 1) + 1 }); });
+  advances.push({ attrs: runner.attrs, dest: 1 }); // the batter
+
+  const willEndInning = gameState.outs + numOuts >= 3;
+  const newBases = { first: null, second: null, third: null };
+  let runs = 0;
+  for (const a of advances) {
+    if (outRunners.has(a.attrs)) continue;
+    if (a.dest >= 4) { if (!willEndInning) runs++; }
+    else newBases[BASE_ORDER[a.dest - 1]] = a.attrs;
+  }
+
+  if (batterOut) runner.active = false; // thrown out at first — stop his sprite short of the bag
+
+  showPitchCall(numOuts >= 2 ? 'Double Play!' : 'Out!');
+
+  gameState.bases = newBases;
+  runnerAnim.t = 0;
+  runnerAnim.forcedAdvance = false;
+  runnerAnim.pending = null;
+  syncBaseRunnerMeshes();
+  if (runs > 0) gameState[battingTeamScoreKey()] += runs;
+
+  const holder = groundPlay.hops[groundPlay.hops.length - 1].cover; // last man with the ball
+  advanceBatter();
+  gameState.outs += numOuts;
+  if (gameState.outs >= 3) {
+    gameState.outs = 0;
+    startInningTransition();
+    gameState.balls = 0;
+    gameState.strikes = 0;
+    updateScoreBug();
+    scheduleResetAfterPlay(1500);
+    return;
+  }
+  endAtBat();
+  // The man holding the ball shows the out a beat, then throws it back to the pitcher.
+  ballReturn.waypoints = [pitcherHandPos()];
+  ballReturn.speed = throwingRatingToThrowSpeed(holder.attrs.throwing);
+  ballReturn.pause = RELAY_PAUSE;
+  ballReturn.relayFielder = null;
+  ballReturn.thrower = holder;
+  ballReturn.onDone = null;
+  ballReturn.active = true;
+  scheduleResetAfterPlay(1500);
+}
+
+// ---------- Unassisted putout at first ----------
+// A slow roller down the first base line (or any grounder the first baseman is
+// closest to) is his to field — there's no one to throw to at the bag, so he
+// carries it over and steps on first himself, racing the batter. Whether he
+// beats the runner is pre-decided from his run time, same as a throw.
+const firstBasePutout = { active: false, fielder: null, out: false };
+
+function startFirstBasemanPutout(fielder) {
+  pitcherCoveringFirst = false; // the first baseman has it and will take the bag himself; pitcher returns
+  const runSpeed = fielderRatingToChaseSpeed(fielder.attrs.speed);
+  const runTime = fielder.mesh.position.distanceTo(FIRST_COVER_POS) / runSpeed;
+  firstBasePutout.out = hitClock + runTime < runnerReachesFirstTime();
+  firstBasePutout.fielder = fielder;
+  firstBasePutout.active = true;
+}
+
+function updateFirstBasePutout(dt) {
+  if (!firstBasePutout.active) return;
+  const f = firstBasePutout.fielder;
+  const target = new THREE.Vector3(FIRST_COVER_POS.x, f.mesh.position.y, FIRST_COVER_POS.z);
+  const toBag = new THREE.Vector3().subVectors(target, f.mesh.position);
+  const dist = toBag.length();
+  if (dist > 0.05) {
+    toBag.normalize();
+    f.mesh.position.addScaledVector(toBag, Math.min(fielderRatingToChaseSpeed(f.attrs.speed) * dt, dist));
+  }
+  ballMesh.position.set(f.mesh.position.x, ballHoldHeight, f.mesh.position.z); // ball carried in his glove
+  if (dist < 0.15) {
+    firstBasePutout.active = false;
+    onFirstBasemanReachedBag();
+  }
+}
+
+// The first baseman has run to the bag — call the play (same out/safe handling as
+// a throw across), then he throws the ball back to the pitcher.
+function onFirstBasemanReachedBag() {
+  const f = firstBasePutout.fielder;
+  if (firstBasePutout.out) {
+    runner.active = false;
+    showPitchCall('Out!');
+    advanceRunnersOnGroundOut();
+    recordOut();
+  } else {
+    showPitchCall('Safe!');
+    if (anyRunnersOn()) {
+      beginRunnerAdvance(true);
+      advanceBatter();
+      endAtBat();
+    } else {
+      recordHit(1);
+    }
+  }
+  if (inningTransition.phase === 'none') {
     ballReturn.waypoints = [pitcherHandPos()];
-    ballReturn.speed = throwingRatingToThrowSpeed(firstBaseman.attrs.throwing);
+    ballReturn.speed = throwingRatingToThrowSpeed(f.attrs.throwing);
     ballReturn.pause = RELAY_PAUSE;
-    ballReturn.relayFielder = firstBaseman; // hold him at the bag until his throw is away
+    ballReturn.relayFielder = null;
+    ballReturn.thrower = f; // holds the bag through the beat, then throws it in
+    ballReturn.onDone = null;
     ballReturn.active = true;
   }
   scheduleResetAfterPlay(1500);
@@ -1508,23 +1980,36 @@ function fieldBall(fielder, caught) {
     runner.active = false;
     showPitchCall('Out!');
     recordOut();
-    startBallReturn(fielder);
+    // An outfielder holds a caught fly a beat before throwing it back in when
+    // there's no one on base to hurry the throw for. An infielder catching a pop
+    // fly always holds a half-second beat before the throw back to the pitcher.
+    const isOutfielder = OUTFIELD_POSITIONS.includes(fielder.posKey);
+    const holdBeat = isOutfielder ? (basesEmpty() ? 0.5 : 0) : 0.5;
+    startBallReturn(fielder, holdBeat);
     scheduleResetAfterPlay(3000);
     return;
   }
 
   const isInfielder = !OUTFIELD_POSITIONS.includes(fielder.posKey);
   if (isInfielder && !inPlay.touchedFence) {
-    // Ground ball to an infielder: throw it across the diamond to first base.
-    startThrowToFirst(fielder);
+    // Ground ball to an infielder. With a runner forced ahead of the batter, go
+    // after the lead runner (and try to turn two). Otherwise it's a play at first:
+    // the first baseman fielding it himself carries it to the bag unassisted (no one
+    // to throw to), while any other infielder throws across — and if the first baseman
+    // charged the ball, the pitcher (already breaking over) covers the bag for the throw.
+    if (leadForceBase()) startGroundForcePlay(fielder);
+    else if (fielder.posKey === '1B') startFirstBasemanPutout(fielder);
+    else startThrowToFirst(fielder);
     return;
   }
 
-  // Fielded in the outfield or off the wall — the pre-rolled hit stands. A ball
-  // called for 4 that stayed in the park settles for a triple off the wall; a
-  // called out that somehow reached the outfield on the ground becomes a single.
+  // Fielded in the outfield or off the wall — the pre-rolled hit stands, and
+  // the batter has been running for it since contact. Only if the result had
+  // to change (a called 4 that stayed in the park settles for a triple; a
+  // called out that somehow reached the outfield becomes a single) does the
+  // runner get redirected here.
   const bases = Math.max(1, Math.min(inPlay.calledBases, 3));
-  sendRunnerToBase(bases);
+  if (bases !== inPlay.calledBases) sendRunnerToBase(bases);
   showPitchCall(bases === 1 ? 'Single!' : bases === 2 ? 'Double!' : 'Triple!');
   recordHit(bases);
   startHitBallReturn(fielder);
@@ -1548,6 +2033,8 @@ function startHitBallReturn(fielder) {
   ballReturn.speed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
   ballReturn.pause = 0;
   ballReturn.relayFielder = relayFielder;
+  ballReturn.thrower = null;
+  ballReturn.onDone = null;
   ballReturn.active = true;
 }
 
@@ -1605,6 +2092,56 @@ function relayAlignment(ballTarget) {
   return { cutoffKey: toRight ? '2B' : 'SS', covers };
 }
 
+// The base a given infielder covers on a pop fly he isn't catching. The two
+// middle infielders both cover second, offset to opposite sides of the bag.
+function infieldCoverSpot(posKey) {
+  switch (posKey) {
+    case '1B': return FIRST;
+    case '3B': return THIRD;
+    case 'C':  return HOME;
+    case '2B': return new THREE.Vector3(SECOND.x - 4 * FT, 0, SECOND.z);
+    case 'SS': return new THREE.Vector3(SECOND.x + 4 * FT, 0, SECOND.z);
+    default:   return SECOND;
+  }
+}
+
+// Which infielder has called for the current pop fly. Latched for the whole
+// flight so a ball landing between two fielders doesn't make the "closest" flip
+// frame to frame and draw several of them toward it.
+let infieldFlyCatcher = null;
+
+// Latched true once the first baseman is the infielder closest to a grounder: it's
+// his ball, so he charges it instead of camping on the bag, then makes the putout
+// himself. Reset each pitch. (See resetPitchToPitcher.)
+let firstBasemanCharging = false;
+
+// Whether the ball is in the first baseman's zone — judged by fielders' HOME
+// positions (his live position drifts to the bag once he starts covering, which
+// would wrongly disqualify him). The catcher is in the pool so dribblers in front
+// of the plate go to the catcher and the first baseman only leaves his bag for
+// balls genuinely down his line.
+const CHARGE_POOL = [...INFIELD_KEYS, 'C'];
+function firstBasemanClaims(pos) {
+  const closest = CHARGE_POOL.map(fielderByPos).reduce((a, b) =>
+    Math.hypot(a.homePos.x - pos.x, a.homePos.z - pos.z) <=
+    Math.hypot(b.homePos.x - pos.x, b.homePos.z - pos.z) ? a : b);
+  return closest.posKey === '1B';
+}
+
+// The bag (cover position) a fielder should run to on a ground ball, or null.
+// During a force/DP the assigned cover men take their bases; otherwise the first
+// baseman alone plays first for the throw across — unless he's charging the ball
+// to field it himself, in which case he doesn't cover.
+function groundCoverTargetFor(f, firstBaseCoverActive) {
+  if (f.posKey === '1B' && firstBasemanCharging) return null; // his ball to field, not cover
+  if (groundPlay.active) {
+    for (const hop of groundPlay.hops) if (hop.cover === f) return COVER_POS_BY_BASE[hop.baseKey];
+    if (f.posKey === '1B') return FIRST_COVER_POS; // keep him home-side even on a lead-only out
+    return null;
+  }
+  return f.posKey === '1B' && firstBaseCoverActive ? FIRST_COVER_POS : null;
+}
+
 // Moves each fielder toward the ball (or its cover/relay spot) while it's live,
 // has them catch/field it when close enough, and sends them home otherwise.
 function updateFielders(dt) {
@@ -1615,21 +2152,64 @@ function updateFielders(dt) {
   const ballTarget = landingSpot || ballMesh.position;
   const outfieldPlay = chasing && !inPlay.touchedFence && distToHome(ballTarget) > OUTFIELD_PLAY_DIST;
   const align = outfieldPlay ? relayAlignment(ballTarget) : null;
+  // A pop fly staying in the infield: the infielders break to where it'll come
+  // down (chasing the ball's low early position would draw them in too far and
+  // let it drop behind them), and the outfielders hold rather than charging in.
+  const infieldFly = !!landingSpot && !outfieldPlay;
+  // On a pop fly, only one infielder (or catcher) goes for the ball; the rest
+  // cover their bases. Latch the caller on the first frame and keep him for the
+  // whole flight so nobody else drifts over.
+  if (infieldFly) {
+    if (!infieldFlyCatcher) {
+      const pool = fielders.filter(f => !OUTFIELD_POSITIONS.includes(f.posKey));
+      infieldFlyCatcher = pool.reduce((a, b) =>
+        Math.hypot(a.mesh.position.x - landingSpot.x, a.mesh.position.z - landingSpot.z) <=
+        Math.hypot(b.mesh.position.x - landingSpot.x, b.mesh.position.z - landingSpot.z) ? a : b);
+    }
+  } else {
+    infieldFlyCatcher = null; // play's not a pop fly (any more): clear for next time
+  }
+  const flyCatcher = infieldFlyCatcher;
   // On an infield grounder the first baseman plays the bag to take the throw.
-  const firstBaseCoverActive = throwToFirst.active ||
-    (chasing && inPlay.touchedGround && !inPlay.touchedFence && !outfieldPlay);
+  const infieldGrounder = chasing && inPlay.touchedGround && !inPlay.touchedFence && !outfieldPlay;
+  const firstBaseCoverActive = throwToFirst.active || infieldGrounder;
+  // If a low ball (grounder or already-bounced) in the first baseman's zone is his,
+  // latch him as the charger the moment it's read — before he wastes time drifting to
+  // cover the bag — so he commits straight to the ball. Latched until the pitch resets,
+  // or cleared if someone else gets to it first.
+  if (chasing && !inPlay.touchedFence && !outfieldPlay &&
+      ballMesh.position.y < CAPSULE_TOTAL_HEIGHT && firstBasemanClaims(ballTarget)) {
+    firstBasemanCharging = true;
+    pitcherCoveringFirst = true; // he's off the bag, so the pitcher breaks over to cover first
+  }
 
   for (const f of fielders) {
+    // The first baseman running the ball to the bag for an unassisted putout owns his
+    // own movement (updateFirstBasePutout) — don't fight it here.
+    if (firstBasePutout.active && firstBasePutout.fielder === f) continue;
     // The cutoff man holds his spot until he's taken the relay throw and sent it on to the pitcher.
-    if (ballReturn.active && ballReturn.relayFielder === f) continue;
+    if (ballReturn.active && (ballReturn.relayFielder === f || ballReturn.thrower === f)) continue;
     const isOutfielder = OUTFIELD_POSITIONS.includes(f.posKey);
     const relayInfielder = !!align && !isOutfielder; // infielder on cutoff/cover duty
-    const coveringFirst = f.posKey === '1B' && firstBaseCoverActive;
+    // Bag this fielder should cover, if any: a force/DP cover during the throw
+    // sequence, or the first baseman taking an ordinary throw across.
+    const coverPos = groundCoverTargetFor(f, firstBaseCoverActive);
     let target;
-    if (!chasing) {
+    if (coverPos) {
+      // Stand just inside the bag (foot on the edge) and hold there for the throw.
+      // Checked before !chasing: the instant the grounder is fielded, chasing flips
+      // false, and this keeps the cover men on their bags through the throws instead
+      // of jogging home mid-play.
+      target = new THREE.Vector3(coverPos.x, f.mesh.position.y, coverPos.z);
+    } else if (firstBasemanCharging && f.posKey === 'C') {
+      target = f.homePos; // the first baseman is charging this one; the catcher stays put
+    } else if (!chasing) {
       target = f.homePos;
     } else if (isOutfielder) {
-      if (landingSpot) {
+      if (infieldFly) {
+        // Pop fly to the infield — hold; the infielders make the catch.
+        target = f.homePos;
+      } else if (landingSpot) {
         // Hold position for a beat while reading the ball off the bat, then break for the landing spot.
         target = hitClock < OUTFIELDER_REACTION_DELAY
           ? f.homePos
@@ -1640,9 +2220,15 @@ function updateFielders(dt) {
     } else if (relayInfielder) {
       const spot = align.covers[f.posKey];
       target = new THREE.Vector3(spot.x, f.mesh.position.y, spot.z);
-    } else if (coveringFirst) {
-      // Stand on first base and wait for the throw (or field a ball that comes right to the bag).
-      target = new THREE.Vector3(FIRST.x, f.mesh.position.y, FIRST.z);
+    } else if (infieldFly) {
+      if (f === flyCatcher) {
+        // Only the closest infielder settles under the pop fly for the catch.
+        target = new THREE.Vector3(landingSpot.x, f.mesh.position.y, landingSpot.z);
+      } else {
+        // Everyone else covers their base.
+        const spot = infieldCoverSpot(f.posKey);
+        target = new THREE.Vector3(spot.x, f.mesh.position.y, spot.z);
+      }
     } else {
       target = new THREE.Vector3(ballMesh.position.x, f.mesh.position.y, ballMesh.position.z);
     }
@@ -1655,8 +2241,9 @@ function updateFielders(dt) {
       clampToPlayableField(f.mesh.position);
     }
 
-    // Cutoff/cover infielders don't field the ball themselves — the outfielder does.
-    if (chasing && !relayInfielder) {
+    // Cutoff/cover infielders don't field the ball themselves — the outfielder
+    // does; and on a pop fly, only the designated catcher makes the play.
+    if (chasing && !relayInfielder && !(infieldFly && f !== flyCatcher)) {
       const horizDist = Math.hypot(f.mesh.position.x - ballMesh.position.x, f.mesh.position.z - ballMesh.position.z);
       // Air catches only happen on plays called as outs — a ball called a hit
       // always finds grass (or the wall), so a nearby fielder plays it on the
@@ -1885,15 +2472,13 @@ function animate() {
         if (gameState.balls >= 4) recordWalk(); // walk, no out
         else updateScoreBug();
       }
-      // Pause for 3 seconds at the stopping point, then reset to the pitcher's hand
-      setTimeout(() => {
-        ballMesh.position.set(
-          pitcherMesh.position.x + PLAYER_RADIUS * 0.8,
-          ballHoldHeight,
-          pitcherMesh.position.z - PLAYER_RADIUS * 0.3
-        );
-        pitch.resetting = false;
-      }, 3000);
+      // Catcher gathers the pitch, then throws it back to the pitcher. pitch.resetting
+      // stays true (blocking the next pitch) until the throw lands in his hand.
+      if (inningTransition.phase === 'none') {
+        setTimeout(startCatcherReturn, 300); // brief beat before the catcher throws it back
+      } else {
+        pitch.resetting = false; // strikeout ended the inning — the teams are swapping
+      }
     }
   }
 
@@ -1902,6 +2487,9 @@ function animate() {
   updateFielders(dt);
   updateBaseRunnerAnim(dt);
   updateThrowToFirst(dt);
+  updateGroundPlay(dt);
+  updateFirstBasePutout(dt);
+  updatePitcherCover(dt);
   updateBallReturn(dt);
   updateInningTransition(dt);
   updateCamera(dt);
