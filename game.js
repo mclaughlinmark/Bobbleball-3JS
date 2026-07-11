@@ -596,7 +596,12 @@ const FIELD_SPOTS_FT = {
   '1B': { x: -51, z: 60 },   // even with the bag, on the infield edge of first's dirt circle
   '2B': { x: -30, z: 110 },  // shaded toward first base
   SS:   { x: 30,  z: 110 },  // shaded toward third base
-  '3B': { x: 54,  z: 66 },   // behind the bag, shaded a step toward second
+  // A step in front of the bag toward home, shaded toward second. The old spot
+  // (54, 66) summed to exactly 120 — the second-to-third basepath is precisely
+  // the line x+z=120 (a diamond-geometry fact, same for any point on that edge),
+  // so he stood squarely on it and a home-run trot ran the runner right through
+  // him. Pulling him in clears the line by a comfortable margin either side.
+  '3B': { x: 48,  z: 59 },
   LF:   { x: 85,  z: 175 },
   CF:   { x: 0,   z: 195 },
   RF:   { x: -85, z: 175 },
@@ -812,7 +817,7 @@ function advanceRunnersOnGroundOut() {
 // the first-base line, visitors to the third-base line), stranded runners jog to
 // their side's baseline, everyone disappears at the line, and the new defense
 // runs on from its baseline to take the field.
-const inningTransition = { phase: 'none', off: [], on: [] }; // phase: 'none' | 'off' | 'on'
+const inningTransition = { phase: 'none', off: [], on: [], isGameOver: false }; // phase: 'none' | 'off' | 'on'
 const TRANSITION_SPEED = fielderRatingToChaseSpeed(10) * 1.75; // hustle so the game isn't delayed
 const ON_FIELD_DELAY = 1.5; // seconds before the first of the new defense steps onto the field
 const PITCHER_HOME = pitcherMesh.position.clone();
@@ -893,6 +898,96 @@ function startInningTransition() {
   inningTransition.phase = 'active';
 }
 
+// ---------- Game over: 9 regulation innings, extra innings until there's a winner ----------
+// Checked after every 3rd out, before deciding whether to flip to the next half-inning:
+//  - Top half just ended, inning 9+, home team leads -> game over (no need to bat last).
+//  - Bottom half just ended, inning 9+, score isn't tied -> game over.
+//  - Otherwise (tied, or the home team trails/ties after the top half) -> play on.
+const REGULATION_INNINGS = 9;
+let gameEnded = false; // true once a winner is locked in — blocks any further pitches
+
+function checkGameOver() {
+  if (gameState.inning < REGULATION_INNINGS) return false;
+  if (gameState.half === 'top') return gameState.homeScore > gameState.visitorScore;
+  return gameState.homeScore !== gameState.visitorScore;
+}
+
+// The fielding side jogs off to its baseline (same choreography as a half-inning
+// swap) but nobody takes the field again — once they clear the line, the winner
+// is announced instead of the next pitch being set up.
+function endGame() {
+  gameEnded = true;
+  announceGameResult(); // show the winner right away, before the teams clear the field
+  const offSide = teamBaselineSide(fieldingTeam());
+  const strandedSide = teamBaselineSide(battingTeam());
+
+  inningTransition.off = [];
+  for (const mesh of [...fielders.map(f => f.mesh), pitcherMesh]) {
+    const ghost = mesh.clone();
+    ghost.material = mesh.material.clone();
+    scene.add(ghost);
+    inningTransition.off.push({ mesh: ghost, target: baselinePoint(mesh.position, offSide), isGhost: true });
+  }
+  for (const key of BASE_ORDER) {
+    const marker = baseRunnerMeshes[key];
+    if (marker.visible) inningTransition.off.push({ mesh: marker, target: baselinePoint(marker.position, strandedSide) });
+  }
+  gameState.bases = { first: null, second: null, third: null };
+  runnerAnim.t = 0;
+  runner.active = false;
+
+  ballMesh.visible = false;
+  ballReturn.active = false;
+  ballReturn.waypoints = [];
+  ballReturn.relayFielder = null;
+  ballReturn.thrower = null;
+  throwToFirst.active = false;
+  groundPlay.active = false;
+  groundPlay.pauseLeft = 0;
+  firstBasePutout.active = false;
+  firstBasemanCharging = false;
+  pitcherCoveringFirst = false;
+  pitcherReturning = false;
+
+  inningTransition.on = []; // nobody takes the field again — the game is over
+  inningTransition.isGameOver = true;
+  inningTransition.phase = 'active';
+}
+
+// Reuses the home-run overlay's look (banner + confetti) for the final result, but
+// left on screen — there's no next pitch to clear it for.
+function announceGameResult() {
+  const overlay = document.getElementById('homerunOverlay');
+  const text = document.getElementById('homerunText');
+  const confettiLayer = document.getElementById('confettiLayer');
+
+  const homeWon = gameState.homeScore > gameState.visitorScore;
+  const winnerLabel = homeWon ? 'Home' : 'Visitor';
+  const winnerScore = homeWon ? gameState.homeScore : gameState.visitorScore;
+  const loserScore = homeWon ? gameState.visitorScore : gameState.homeScore;
+
+  overlay.style.display = 'block';
+  text.innerHTML = `${winnerLabel} Wins!<div class="gameover-score">Final: ${winnerScore}-${loserScore}</div>`;
+  text.classList.remove('playing', 'gameover');
+  void text.offsetWidth; // restart the CSS animation
+  text.classList.add('gameover');
+
+  confettiLayer.innerHTML = '';
+  const colors = ['#ffd700', '#ff4136', '#2f7df6', '#ffffff', '#2ecc40', '#ff851b'];
+  const pieceCount = 160;
+  for (let i = 0; i < pieceCount; i++) {
+    const piece = document.createElement('div');
+    piece.className = 'confetti-piece';
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
+    const duration = 2 + Math.random() * 1.5;
+    const delay = Math.random() * 0.6;
+    piece.style.animationDuration = `${duration}s`;
+    piece.style.animationDelay = `${delay}s`;
+    confettiLayer.appendChild(piece);
+  }
+}
+
 function updateInningTransition(dt) {
   if (inningTransition.phase !== 'active') return;
   const step = (list, onArrive) => {
@@ -926,8 +1021,14 @@ function updateInningTransition(dt) {
   step(inningTransition.on, () => {});
   if (inningTransition.off.length === 0 && inningTransition.on.length === 0) {
     inningTransition.phase = 'none';
-    ballMesh.visible = true; // ball reappears in the new pitcher's hand
-    resetPitchToPitcher();
+    if (inningTransition.isGameOver) {
+      // The winner banner was already shown up front (see endGame) — nobody's
+      // taking the field again, so there's nothing left to do once they clear it.
+      inningTransition.isGameOver = false;
+    } else {
+      ballMesh.visible = true; // ball reappears in the new pitcher's hand
+      resetPitchToPitcher();
+    }
   }
 }
 
@@ -1046,8 +1147,13 @@ function pickLandingAwayFromFielders(minDistFt, maxDistFt) {
   return best;
 }
 
+// TEST HOOK: force the very first ball put in play to be a home run, then let
+// the normal roll take over for every at-bat after that. Remove once done testing.
+let __forceFirstHitHomer = true;
+
 // Rolls what the play becomes. `quality` is 0..1 swing contact quality.
 function rollPlayOutcome(quality) {
+  if (__forceFirstHitHomer) { __forceFirstHitHomer = false; return 'homer'; }
   const matchup = (batterAttributes.hitting - pitcherAttributes.throwing) / 9; // -1..1
   const hitChance = clamp(0.30 + matchup * 0.08 + (quality - 0.5) * 0.18, 0.12, 0.55);
 
@@ -1230,18 +1336,21 @@ function endAtBat() {
 function recordOut() {
   advanceBatter();
   gameState.outs++;
-  if (gameState.outs >= 3) {
-    // Side retired: the transition flips the half-inning, jogs the old defense
-    // (and stranded runners) off, and refreshes the players at the swap — so
-    // here just reset the count and scoreboard.
-    gameState.outs = 0;
-    startInningTransition();
-    gameState.balls = 0;
-    gameState.strikes = 0;
-    updateScoreBug();
-    return;
-  }
+  if (gameState.outs >= 3) { handleThirdOut(); return; }
   endAtBat();
+}
+
+// Shared by every out-recording path that can reach the 3rd out: resets the count,
+// then either flips to the next half-inning (the transition jogs the old defense and
+// stranded runners off, and refreshes the players at the swap) or, in the 9th inning
+// or later, ends the game if it's already decided (see checkGameOver).
+function handleThirdOut() {
+  gameState.outs = 0;
+  gameState.balls = 0;
+  gameState.strikes = 0;
+  if (checkGameOver()) endGame();
+  else startInningTransition();
+  updateScoreBug();
 }
 
 // Batter draws a walk: only forces runners who have no open base behind them.
@@ -1508,6 +1617,7 @@ const ballReturn = {
   relayFielder: null, // cutoff man to hold in place until he's relayed the ball on
   thrower: null, // the fielder holding the ball through an initial pause — stays put until his throw is away
   onDone: null, // optional callback fired once the ball reaches the pitcher
+  holdForRunner: false, // wait for the batter-runner's sprite to finish the base path before throwing in
 };
 const RELAY_PAUSE = 0.5; // beat between the cutoff man catching it and throwing to the pitcher
 
@@ -1558,6 +1668,15 @@ function basesEmpty() {
 
 function updateBallReturn(dt) {
   if (!ballReturn.active || ballReturn.waypoints.length === 0) return;
+  // On a base hit, the fielder holds the ball (and his spot) until the batter-runner's
+  // sprite has actually finished running out the hit — so the return throw never
+  // starts while the runner's still en route, which would make a stand-up double or
+  // triple look like a bang-bang throw that might have had him.
+  if (ballReturn.holdForRunner) {
+    if (runner.active) return;
+    ballReturn.holdForRunner = false;
+    ballReturn.thrower = null; // released — the throw is away
+  }
   // Whoever has the ball holds it (and his spot) a beat before throwing on.
   if (ballReturn.pause > 0) {
     ballReturn.pause -= dt;
@@ -1881,11 +2000,7 @@ function resolveGroundPlay() {
   advanceBatter();
   gameState.outs += numOuts;
   if (gameState.outs >= 3) {
-    gameState.outs = 0;
-    startInningTransition();
-    gameState.balls = 0;
-    gameState.strikes = 0;
-    updateScoreBug();
+    handleThirdOut();
     scheduleResetAfterPlay(1500);
     return;
   }
@@ -2033,7 +2148,11 @@ function startHitBallReturn(fielder) {
   ballReturn.speed = throwingRatingToThrowSpeed(fielder.attrs.throwing);
   ballReturn.pause = 0;
   ballReturn.relayFielder = relayFielder;
-  ballReturn.thrower = null;
+  // Holds the ball (and his spot) until the batter-runner's sprite has actually
+  // finished running out the hit, so the throw back in never starts while he's
+  // still between bases — see the holdForRunner check in updateBallReturn.
+  ballReturn.thrower = fielder;
+  ballReturn.holdForRunner = true;
   ballReturn.onDone = null;
   ballReturn.active = true;
 }
@@ -2319,6 +2438,7 @@ const PLATE_DEPTH = 1.4; // matches the home plate shape's depth, used for foul 
 const PITCH_HEIGHT_SPREAD = CAPSULE_TOTAL_HEIGHT * 0.4; // how far above/below the middle a pitch can arrive
 
 function throwPitch() {
+  if (gameEnded) return; // final out is in — no more pitches
   if (pitch.inFlight || pitch.resetting || inPlay.active) return;
   if (inningTransition.phase !== 'none') return; // teams are still swapping sides
   showNameCards();
