@@ -8,12 +8,17 @@ import * as THREE from 'three';
 // throws, fielding — and keep the head wobbling the whole time.
 //
 // Anatomy of the returned rig (all pivots are proper Groups):
-//   root                 — feet at y=0, faces +Z
-//   ├─ leftLeg/rightLeg  — pivot at the hip (rotate X to stride)
-//   ├─ torso             — jersey, belt, neck (static meshes)
-//   ├─ leftArm/rightArm  — pivot at the shoulder (rotate X/Z to swing/throw)
-//   └─ headPivot         — pivot at the neck; the whole head+cap+face hangs
-//                          from this, and the bobble spring drives its tilt
+//   root                    — feet at y=0, faces +Z
+//   ├─ leftLeg/rightLeg     — pivot at the hip (rotate X to stride)
+//   │    └─ leftKnee/rightKnee — pivot at the knee (rotate +X to fold the
+//   │                          shin back; never rotate negative — knees
+//   │                          don't hyperextend)
+//   ├─ torso                — jersey, belt, neck (static meshes)
+//   ├─ leftArm/rightArm     — pivot at the shoulder (rotate X/Z to swing/throw)
+//   │    └─ leftElbow/rightElbow — pivot at the elbow (rotate -X to bend the
+//   │                          forearm up/forward; keep it ≤ 0)
+//   └─ headPivot            — pivot at the neck; the whole head+cap+face hangs
+//                             from this, and the bobble spring drives its tilt
 //
 // Team color goes on the jersey, sleeves, and cap; pants stay cream, accents
 // (undersleeves, socks, belt) stay navy, skin/shoes/hair fixed — so a white
@@ -44,28 +49,37 @@ function add(parent, geo, material, x, y, z) {
   return mesh;
 }
 
-// One leg, pivoted at the hip: cream pant, navy sock, black shoe.
+// One leg, pivoted at the hip, with a knee joint: cream pant thigh, then a
+// knee pivot carrying the navy sock shin and shoe. Returns both pivots.
 function buildLeg(side) { // side: -1 = left, +1 = right
   const leg = new THREE.Group();
-  add(leg, new THREE.CylinderGeometry(0.14, 0.155, 0.34, 12), mat(CREAM), 0, -0.17, 0);
-  add(leg, new THREE.CylinderGeometry(0.11, 0.115, 0.21, 12), mat(NAVY), 0, -0.43, 0);
-  const shoe = add(leg, new THREE.SphereGeometry(0.16, 16, 12), mat(SHOE, { roughness: 0.4 }), 0, -0.53, 0.06);
+  add(leg, new THREE.CylinderGeometry(0.14, 0.155, 0.30, 12), mat(CREAM), 0, -0.16, 0); // thigh
+  const knee = new THREE.Group();
+  knee.position.set(0, -0.34, 0);
+  add(knee, new THREE.SphereGeometry(0.135, 14, 12), mat(CREAM), 0, 0.02, 0);            // knee ball keeps the joint smooth when bent
+  add(knee, new THREE.CylinderGeometry(0.11, 0.115, 0.21, 12), mat(NAVY), 0, -0.09, 0);  // sock shin
+  const shoe = add(knee, new THREE.SphereGeometry(0.16, 16, 12), mat(SHOE, { roughness: 0.4 }), 0, -0.19, 0.06);
   shoe.scale.set(1, 0.55, 1.55);
-  return leg;
+  leg.add(knee);
+  return { leg, knee };
 }
 
-// One arm, pivoted at the shoulder, hanging straight down in rest pose.
-// Built from a rounded shoulder ball and overlapping capsules of shrinking
-// radius so the whole limb tapers smoothly — no hard cylinder rims.
+// One arm, pivoted at the shoulder, with an elbow joint: rounded shoulder ball
+// and jersey/undersleeve capsules down to the elbow pivot, which carries the
+// bare forearm and hand. Hangs straight down in rest pose. Returns both pivots.
 function buildArm(side, jerseyMat) {
   const arm = new THREE.Group();
   add(arm, new THREE.SphereGeometry(0.14, 18, 14), jerseyMat, 0, -0.04, 0);           // rounded shoulder
   add(arm, new THREE.CapsuleGeometry(0.12, 0.16, 6, 16), jerseyMat, 0, -0.15, 0);     // jersey sleeve
-  add(arm, new THREE.CapsuleGeometry(0.09, 0.14, 6, 16), mat(NAVY), 0, -0.32, 0);     // navy undersleeve
-  add(arm, new THREE.CapsuleGeometry(0.075, 0.14, 6, 16), mat(SKIN), 0, -0.46, 0);    // forearm
-  add(arm, new THREE.SphereGeometry(0.09, 16, 12), mat(SKIN), 0, -0.59, 0);           // hand
+  add(arm, new THREE.CapsuleGeometry(0.09, 0.10, 6, 16), mat(NAVY), 0, -0.29, 0);     // navy undersleeve to the elbow
+  const elbow = new THREE.Group();
+  elbow.position.set(0, -0.36, 0);
+  add(elbow, new THREE.SphereGeometry(0.085, 12, 10), mat(NAVY), 0, 0.01, 0);         // elbow ball keeps the joint smooth when bent
+  add(elbow, new THREE.CapsuleGeometry(0.075, 0.14, 6, 16), mat(SKIN), 0, -0.10, 0);  // forearm
+  add(elbow, new THREE.SphereGeometry(0.09, 16, 12), mat(SKIN), 0, -0.23, 0);         // hand (0.59 below the shoulder when straight)
+  arm.add(elbow);
   arm.rotation.z = side * -0.10; // rest a touch out from the body
-  return arm;
+  return { arm, elbow };
 }
 
 // The big cherub head with cap, hung from the neck pivot. Face looks down +Z.
@@ -162,10 +176,10 @@ export function buildBobblehead(teamColor) {
   const root = new THREE.Group();
   const teamMat = mat(teamColor, { roughness: 0.55 });
 
-  // Legs (hip pivots)
-  const leftLeg = buildLeg(-1);
+  // Legs (hip pivots, each carrying a knee pivot)
+  const { leg: leftLeg, knee: leftKnee } = buildLeg(-1);
   leftLeg.position.set(-0.17, 0.62, 0);
-  const rightLeg = buildLeg(1);
+  const { leg: rightLeg, knee: rightKnee } = buildLeg(1);
   rightLeg.position.set(0.17, 0.62, 0);
   root.add(leftLeg, rightLeg);
 
@@ -179,11 +193,12 @@ export function buildBobblehead(teamColor) {
   add(torso, new THREE.CylinderGeometry(0.12, 0.13, 0.12, 12), mat(SKIN), 0, 1.38, 0);
   root.add(torso);
 
-  // Arms (shoulder pivots) — tucked slightly under the shoulder dome so the
-  // shoulder balls roll out of the torso instead of perching on top of it.
-  const leftArm = buildArm(-1, teamMat);
+  // Arms (shoulder pivots, each carrying an elbow pivot) — tucked slightly
+  // under the shoulder dome so the shoulder balls roll out of the torso
+  // instead of perching on top of it.
+  const { arm: leftArm, elbow: leftElbow } = buildArm(-1, teamMat);
   leftArm.position.set(-0.315, 1.20, 0);
-  const rightArm = buildArm(1, teamMat);
+  const { arm: rightArm, elbow: rightElbow } = buildArm(1, teamMat);
   rightArm.position.set(0.315, 1.20, 0);
   root.add(leftArm, rightArm);
 
@@ -196,7 +211,8 @@ export function buildBobblehead(teamColor) {
   root.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
 
   return {
-    root, headPivot, leftArm, rightArm, leftLeg, rightLeg, torso, teamMat,
+    root, headPivot, leftArm, rightArm, leftElbow, rightElbow,
+    leftLeg, rightLeg, leftKnee, rightKnee, torso, teamMat,
     // Bobble spring state: tilt angle + angular velocity on two axes,
     // plus a phase offset so a field of dolls doesn't wobble in unison.
     bobble: { ax: 0, vx: 0, az: 0, vz: 0, phase: Math.random() * Math.PI * 2, t: 0 },
@@ -224,6 +240,22 @@ export function updateBobble(doll, dt, agitation = 0) {
   b.az += b.vz * dt;
   doll.headPivot.rotation.x = b.ax;
   doll.headPivot.rotation.z = b.az;
+}
+
+// Adds a vintage leather fielder's mitt over the hand hanging from the given
+// elbow pivot (pass doll.leftElbow or doll.rightElbow — note the node names
+// mirror anatomy: the rightElbow node is the doll's anatomical LEFT hand).
+export function addGlove(elbowPivot) {
+  const leather = mat(0x8a5a2b, { roughness: 0.85 });
+  const dark = mat(0x6e4520, { roughness: 0.9 });
+  // The mitt: an oversized rounded pad swallowing the hand, palm facing forward
+  const mitt = add(elbowPivot, new THREE.SphereGeometry(0.155, 16, 14), leather, 0, -0.25, 0.03);
+  mitt.scale.set(0.8, 1.15, 1.2);
+  // Thumb pad on the inside edge, and a darker pocket disc up front
+  add(elbowPivot, new THREE.SphereGeometry(0.07, 10, 8), leather, 0, -0.14, 0.12).scale.set(0.8, 1.2, 1);
+  const pocket = add(elbowPivot, new THREE.SphereGeometry(0.09, 12, 10), dark, 0, -0.26, 0.14);
+  pocket.scale.set(0.75, 1, 0.45);
+  return mitt;
 }
 
 // One-off impulse to the head spring (bat contact, hard stop at a bag, a catch).
