@@ -462,10 +462,31 @@ function makePlayerDoll(color, restMode) {
                  // (re-set every frame by whichever system expects the catch)
     run: 0, runPhase: Math.random() * Math.PI * 2,
     action: null, actionT: 0,
+    throwSign: 1, // 1 = throws right-handed (as-authored), -1 = left-handed (mirrored); see setThrowHandedness
+    glove: null, // the reparentable mitt Group for whoever fields (fielders, pitcher) — see setThrowHandedness
   };
   dollRecByWrapper.set(wrapper, rec);
   playerDolls.push(rec);
   return rec;
+}
+
+// The glove always rides the OFF hand: rightElbow (anatomical left) for a
+// right-handed thrower, leftElbow (anatomical right) for a lefty — node names
+// mirror anatomy, so this is deliberately the opposite-looking mapping.
+function gloveElbowFor(rec) { return rec.throwSign === 1 ? rec.doll.rightElbow : rec.doll.leftElbow; }
+// The hand a throw is released from: the anatomical arm opposite the glove.
+function throwingElbowFor(rec) { return rec.throwSign === 1 ? rec.doll.leftElbow : rec.doll.rightElbow; }
+// Which side a glove-up "reach" pose raises, matching whichever hand the mitt is on.
+function gloveReachSide(rec) { return rec.throwSign === 1 ? 'right' : 'left'; }
+
+// Assigns (or re-assigns, e.g. when the fielding team swaps between innings)
+// which hand a fielder/pitcher throws with: reparents his mitt onto the
+// correct (off) hand and flips throwSign so his throw/pitch animation mirrors.
+function setThrowHandedness(rec, throwHand) {
+  const sign = throwHand === 'L' ? -1 : 1;
+  if (rec.throwSign === sign) return;
+  rec.throwSign = sign;
+  if (rec.glove) gloveElbowFor(rec).add(rec.glove); // Object3D.add() reparents
 }
 
 // Shortest signed angle from `a` to `b`.
@@ -497,7 +518,8 @@ function lerpAngle(a, b, t) {
 function makeDollGhost(wrapper) {
   const src = dollRecByWrapper.get(wrapper);
   const rec = makePlayerDoll(src.doll.teamMat.color.getHex(), 'home');
-  addGlove(rec.doll.rightElbow); // the retiring defense carries its mitts off
+  rec.throwSign = src.throwSign; // carries his mitt off on the same hand he fielded with
+  addGlove(gloveElbowFor(rec)); // the retiring defense carries its mitts off
   rec.wrapper.position.copy(wrapper.position);
   rec.yaw = wrapper.rotation.y;
   rec.wrapper.rotation.y = wrapper.rotation.y;
@@ -642,14 +664,16 @@ function updateDolls(dt) {
       // the pitcher). Once he's out running the bases and parked on a bag,
       // he just faces the mound like any runner.
       const inBox = Math.hypot(p.x - batterPos.x, p.z - batterPos.z) < 2;
-      targetYaw = inBox ? BATTER_STANCE_YAW : Math.atan2(moundCenter.x - p.x, moundCenter.z - p.z);
+      targetYaw = inBox ? BATTER_STANCE_YAW * batSideSign : Math.atan2(moundCenter.x - p.x, moundCenter.z - p.z);
     } else if (rec.restMode === 'pitcher') {
       // On the mound the pitcher sets up SIDEWAYS — facing first base, glove-side
       // shoulder pointed at the batter — and the delivery rotates him through to
       // face home, where he stays (squared, ready to field) until the next-pitch
       // reset. Off the mound (covering first) he faces home like everyone else.
       const onMound = Math.hypot(p.x - moundCenter.x, p.z - moundCenter.z) < 3;
-      targetYaw = (onMound && !pitcherSquared) ? -Math.PI / 2 : Math.atan2(HOME.x - p.x, HOME.z - p.z);
+      // The sideways set stance is authored at -PI/2 (facing first base) for a
+      // lefty (throwSign -1); a righty sets up mirrored, facing third base.
+      targetYaw = (onMound && !pitcherSquared) ? (Math.PI / 2) * rec.throwSign : Math.atan2(HOME.x - p.x, HOME.z - p.z);
     } else {
       targetYaw = Math.atan2(HOME.x - p.x, HOME.z - p.z);
     }
@@ -676,12 +700,13 @@ function updateDolls(dt) {
     let crouch = 0; // lowers the whole body when the knees bend to squat (fielding)
     // Batting stance: elbows folded to bring both hands onto the bat handle,
     // knees flexed, whenever the batter is standing in the box and not mid-action.
+    // Lead/back arm swap sides for a right-handed hitter (the mirrored stance).
     if (rec.restMode === 'batter' && !moving && !rec.action &&
         Math.hypot(p.x - batterPos.x, p.z - batterPos.z) < 2) {
-      armL = STANCE_ARM_LEAD;
-      armR = STANCE_ARM_BACK;
-      elbL = STANCE_ELB_LEAD;
-      elbR = STANCE_ELB_BACK;
+      armL = batSideSign === 1 ? STANCE_ARM_LEAD : STANCE_ARM_BACK;
+      armR = batSideSign === 1 ? STANCE_ARM_BACK : STANCE_ARM_LEAD;
+      elbL = batSideSign === 1 ? STANCE_ELB_LEAD : STANCE_ELB_BACK;
+      elbR = batSideSign === 1 ? STANCE_ELB_BACK : STANCE_ELB_LEAD;
       kneeL = kneeR = STANCE_KNEE;
       lean = STANCE_LEAN;
     }
@@ -705,53 +730,72 @@ function updateDolls(dt) {
         // A finished pitch/swing ends with the body rotated: fold the yaw
         // track's final offset into the body yaw so dropping the action
         // doesn't snap him back — the rest easing unwinds him naturally.
-        if (rec.action === 'pitch') rec.yaw += PITCH_END_YAW;
-        else if (rec.action === 'swing') rec.yaw += SWING_END_YAW;
+        // PITCH_TRACKS is authored for a lefty (throwSign -1); a righty mirrors
+        // both the rotation direction and which channel the sign flip applies to.
+        if (rec.action === 'pitch') rec.yaw += PITCH_END_YAW * -rec.throwSign;
+        else if (rec.action === 'swing') rec.yaw += SWING_END_YAW * batSideSign;
         rec.action = null;
       } else if (rec.action === 'pitch') {
         // Full windup-and-delivery, driven by the keyframe tracks above.
-        armR = track(PITCH_TRACKS.armR, t);
-        elbR = track(PITCH_TRACKS.elbR, t);
-        armL = track(PITCH_TRACKS.armL, t);
-        elbL = track(PITCH_TRACKS.elbL, t);
-        legL = track(PITCH_TRACKS.legL, t);
-        kneeL = track(PITCH_TRACKS.kneeL, t);
-        legR = track(PITCH_TRACKS.legR, t);
-        kneeR = track(PITCH_TRACKS.kneeR, t);
-        yawOffset = track(PITCH_TRACKS.yaw, t);
+        // Authored for a lefty (the delivery whips the rightArm/rightElbow
+        // channel); a righty swaps every L/R track pair and reverses the
+        // body rotation.
+        const mirror = rec.throwSign === 1;
+        armR = track(mirror ? PITCH_TRACKS.armL : PITCH_TRACKS.armR, t);
+        elbR = track(mirror ? PITCH_TRACKS.elbL : PITCH_TRACKS.elbR, t);
+        armL = track(mirror ? PITCH_TRACKS.armR : PITCH_TRACKS.armL, t);
+        elbL = track(mirror ? PITCH_TRACKS.elbR : PITCH_TRACKS.elbL, t);
+        legL = track(mirror ? PITCH_TRACKS.legR : PITCH_TRACKS.legL, t);
+        kneeL = track(mirror ? PITCH_TRACKS.kneeR : PITCH_TRACKS.kneeL, t);
+        legR = track(mirror ? PITCH_TRACKS.legL : PITCH_TRACKS.legR, t);
+        kneeR = track(mirror ? PITCH_TRACKS.kneeL : PITCH_TRACKS.kneeR, t);
+        yawOffset = track(PITCH_TRACKS.yaw, t) * -rec.throwSign;
         lean = track(PITCH_TRACKS.lean, t);
       } else if (rec.action === 'swing') {
         // Full swing from the stance: coil, stride, hips fire through the
         // zone, follow through high — driven by the keyframe tracks above.
-        armL = track(SWING_TRACKS.armL, t);
-        armR = track(SWING_TRACKS.armR, t);
-        elbL = track(SWING_TRACKS.elbL, t);
-        elbR = track(SWING_TRACKS.elbR, t);
-        legL = track(SWING_TRACKS.legL, t);
-        kneeL = track(SWING_TRACKS.kneeL, t);
-        legR = track(SWING_TRACKS.legR, t);
-        kneeR = track(SWING_TRACKS.kneeR, t);
-        yawOffset = track(SWING_TRACKS.yaw, t);
+        // A righty's swing is the mirror image: every L track drives the R
+        // limb (and vice versa) and the body rotation runs the other way.
+        const mirrored = batSideSign === -1;
+        armL = track(mirrored ? SWING_TRACKS.armR : SWING_TRACKS.armL, t);
+        armR = track(mirrored ? SWING_TRACKS.armL : SWING_TRACKS.armR, t);
+        elbL = track(mirrored ? SWING_TRACKS.elbR : SWING_TRACKS.elbL, t);
+        elbR = track(mirrored ? SWING_TRACKS.elbL : SWING_TRACKS.elbR, t);
+        legL = track(mirrored ? SWING_TRACKS.legR : SWING_TRACKS.legL, t);
+        kneeL = track(mirrored ? SWING_TRACKS.kneeR : SWING_TRACKS.kneeL, t);
+        legR = track(mirrored ? SWING_TRACKS.legL : SWING_TRACKS.legR, t);
+        kneeR = track(mirrored ? SWING_TRACKS.kneeL : SWING_TRACKS.kneeR, t);
+        yawOffset = track(SWING_TRACKS.yaw, t) * batSideSign;
         lean = track(SWING_TRACKS.lean, t);
       } else if (rec.action === 'throw') {
-        // A fielder's quick snap throw, RIGHT-handed: the anatomical right
-        // arm (the leftArm node — node names mirror anatomy) cocks behind
-        // with the forearm folded, whips over as the elbow snaps straight,
-        // recovers; the gloved left hand leads and tucks, with a little body
-        // pivot so it isn't just an arm flailing.
-        armL = track([[0, 0], [0.3, 0.7], [0.55, -2.2], [1, 0]], t);
-        elbL = track([[0, 0], [0.3, -1.2], [0.55, -0.15], [1, 0]], t);
-        armR = track([[0, 0], [0.3, -0.7], [0.6, -0.1], [1, 0]], t);
-        elbR = track([[0, 0], [0.3, -0.5], [0.6, 0], [1, 0]], t);
-        yawOffset = track([[0, 0], [0.3, -0.55], [0.6, 0.15], [1, 0]], t);
+        // A fielder's quick snap throw: the throwing arm cocks behind with the
+        // forearm folded, whips over as the elbow snaps straight, recovers;
+        // the gloved hand leads and tucks, with a little body pivot so it
+        // isn't just an arm flailing. Authored for a righty (throwing arm =
+        // leftArm/leftElbow, the anatomical right — node names mirror
+        // anatomy); a lefty swaps which arm gets which track, and the body
+        // pivot reverses direction.
+        const main   = track([[0, 0], [0.3, 0.7], [0.55, -2.2], [1, 0]], t);
+        const mainElb = track([[0, 0], [0.3, -1.2], [0.55, -0.15], [1, 0]], t);
+        const off    = track([[0, 0], [0.3, -0.7], [0.6, -0.1], [1, 0]], t);
+        const offElb = track([[0, 0], [0.3, -0.5], [0.6, 0], [1, 0]], t);
+        const righty = rec.throwSign === 1;
+        armL = righty ? main : off;
+        elbL = righty ? mainElb : offElb;
+        armR = righty ? off : main;
+        elbR = righty ? offElb : mainElb;
+        yawOffset = track([[0, 0], [0.3, -0.55], [0.6, 0.15], [1, 0]], t) * rec.throwSign;
         lean = track([[0, 0], [0.55, 0.2], [1, 0]], t);
       } else if (rec.action === 'catch') {
-        // Squeeze a fly ball: the gloved (anatomical-left) arm reaches up to
-        // meet the ball, holds it a beat overhead, and comes back down.
+        // Squeeze a fly ball: the gloved arm reaches up to meet the ball,
+        // holds it a beat overhead, and comes back down. Glove arm is
+        // rightArm (anatomical left) for a righty, leftArm for a lefty.
         const reach = Math.sin(Math.PI * t);
-        armR = -2.35 * reach;
-        elbR = -0.3 * reach;
-        armL = -0.5 * reach;
+        const gloveArm = rec.throwSign === 1 ? 'R' : 'L';
+        armR = gloveArm === 'R' ? -2.35 * reach : -0.5 * reach;
+        elbR = gloveArm === 'R' ? -0.3 * reach : 0;
+        armL = gloveArm === 'L' ? -2.35 * reach : -0.5 * reach;
+        elbL = gloveArm === 'L' ? -0.3 * reach : 0;
         lean = -0.08 * reach;
       } else if (rec.action === 'field') {
         // Squat down for the ball: knees fold (the crouch drops the whole
@@ -780,20 +824,28 @@ function updateDolls(dt) {
     // which lag their tracks); the hit collision sweeps with it. Any other
     // time the wrist eases back to the stance angle.
     if (rec.restMode === 'batter') {
+      // The top hand (bat side) is the rightArm/rightElbow nodes for a lefty,
+      // leftArm/leftElbow for a righty — the same nodes setBatterHandedness
+      // parents the bat to.
+      const topArm = batSideSign === 1 ? doll.rightArm : doll.leftArm;
+      const topElb = batSideSign === 1 ? doll.rightElbow : doll.leftElbow;
       if (rec.action === 'swing') {
         const barrel = track(SWING_TRACKS.barrel, rec.actionT / DOLL_ACTION_DUR.swing);
-        batGroup.rotation.x = barrel - doll.rightArm.rotation.x - doll.rightElbow.rotation.x;
+        batGroup.rotation.x = barrel - topArm.rotation.x - topElb.rotation.x;
       } else {
-        const wrist = BAT_BARREL_STANCE - doll.rightArm.rotation.x - doll.rightElbow.rotation.x;
+        const wrist = BAT_BARREL_STANCE - topArm.rotation.x - topElb.rotation.x;
         batGroup.rotation.x += (wrist - batGroup.rotation.x) * ease;
       }
       // In the stance the lead arm reaches ACROSS the chest (a lateral swing
       // of the shoulder, which x-pitching alone can't do) so the lead hand
       // sits on the bat handle next to the top hand; it swings back to the
-      // arm's natural hang the moment he swings or leaves the box.
+      // arm's natural hang the moment he swings or leaves the box. The lead
+      // arm is the leftArm node for a lefty, rightArm (with the lateral
+      // z-swing mirrored) for a righty.
       const inStance = !moving && !rec.action &&
         Math.hypot(p.x - batterPos.x, p.z - batterPos.z) < 2;
-      doll.leftArm.rotation.z += ((inStance ? 0.6 : 0.10) - doll.leftArm.rotation.z) * ease;
+      const leadArm = batSideSign === 1 ? doll.leftArm : doll.rightArm;
+      leadArm.rotation.z += (batSideSign * (inStance ? 0.6 : 0.10) - leadArm.rotation.z) * ease;
     }
     doll.root.rotation.x += (lean - doll.root.rotation.x) * ease;
     doll.root.position.y += ((-standHeight - crouch) - doll.root.position.y) * ease;
@@ -838,9 +890,16 @@ function updateDolls(dt) {
 
 // ---------- Pitcher doll on the mound (set up sideways, glove shoulder to the plate) ----------
 const pitcherRec = makePlayerDoll(0xffffff, 'pitcher');
-// The pitcher throws lefty (his delivery whips the rightArm node = anatomical
-// left arm), so his mitt goes on the anatomical right hand (leftElbow node).
-addGlove(pitcherRec.doll.leftElbow);
+// The delivery (PITCH_TRACKS below) is authored for a LEFTY: it whips the
+// rightArm node (anatomical left arm — node names mirror anatomy), so his
+// mitt goes on the anatomical right hand (leftElbow node). throwSign starts
+// at -1 to match; setThrowHandedness (called from refreshActivePlayers) flips
+// it to 1 and mirrors the whole delivery for a right-handed pitcher.
+pitcherRec.throwSign = -1;
+const pitcherGlove = new THREE.Group();
+addGlove(pitcherGlove);
+pitcherRec.doll.leftElbow.add(pitcherGlove);
+pitcherRec.glove = pitcherGlove;
 pitcherRec.yaw = -Math.PI / 2; // start already in the sideways set stance
 const pitcherMesh = pitcherRec.wrapper;
 pitcherMesh.position.set(moundCenter.x, standHeight + 0.4, moundCenter.z);
@@ -874,7 +933,7 @@ const ballInGlove = { rec: null, node: null, timeLeft: 0 };
 
 function showBallInGlove(rec, seconds = 0.5, gloveNode = null) {
   ballInGlove.rec = rec;
-  ballInGlove.node = gloveNode || rec.doll.rightElbow; // fielders wear the mitt on the rightElbow node
+  ballInGlove.node = gloveNode || gloveElbowFor(rec); // whichever elbow currently carries his mitt
   ballInGlove.timeLeft = seconds;
   ballMesh.visible = true;
 }
@@ -885,12 +944,11 @@ function releaseBallFromGlove() { // a throw is away — the ball flies visibly 
   ballMesh.visible = true;
 }
 
-// A fielder's throw leaves from his THROWING hand — the anatomical right, the
-// leftElbow node (node names mirror anatomy) — not from the mitt where the
-// ball was held. Call at the moment a throw is triggered.
+// A fielder's throw leaves from his THROWING hand, not the mitt where the ball
+// was held. Call at the moment a throw is triggered.
 function launchThrowFrom(rec) {
   releaseBallFromGlove();
-  ballMesh.position.copy(rec.doll.leftElbow.localToWorld(new THREE.Vector3(0, -0.25, 0.05)));
+  ballMesh.position.copy(throwingElbowFor(rec).localToWorld(new THREE.Vector3(0, -0.25, 0.05)));
 }
 
 function updateBallInGlove(dt) {
@@ -905,11 +963,14 @@ function updateBallInGlove(dt) {
   }
 }
 
-// ---------- Batter doll in the left-handed batter's box, holding a bat ----------
+// ---------- Batter doll in the batter's box, holding a bat ----------
+// The rig, stance pose, and swing tracks are all authored for a LEFT-handed
+// hitter; a righty is rendered as an exact mirror across the home-to-CF line
+// (see setBatterHandedness / batSideSign below).
 const batterRec = makePlayerDoll(0xff3b30, 'batter'); // recolored to the batting team each at-bat
 batterRec.yaw = BATTER_STANCE_YAW; // start already sideways in the stance
 const batterMesh = batterRec.wrapper;
-// Left-handed batter's box center (matches makeBatterBox(-1) placement)
+// Batter's box center (starts lefty; mirrors to +x for a right-handed hitter)
 const lhBoxGap = 0.85, lhBoxWidth = 1.2, lhBoxLength = 1.8;
 const batterPos = new THREE.Vector3(
   HOME.x - (lhBoxGap + lhBoxWidth / 2),
@@ -936,6 +997,34 @@ batGroup.add(batMesh);
 batGroup.position.set(0.1, -0.23, 0.05); // at the hand (0.23 below the elbow), nudged toward the catcher side
 batGroup.rotation.x = BAT_WRIST_STANCE;
 batterRec.doll.rightElbow.add(batGroup); // top hand (catcher-side arm in the sideways stance)
+
+// ---------- Batter handedness: each hitter bats from his batHand side ----------
+// Everything batting-related was authored for a lefty; a righty is its exact
+// mirror across the home-to-CF line: opposite box, negated stance yaw and
+// swing yaw, L/R limb tracks swapped, and the bat moved to the other top hand.
+// batSideSign multiplies every yaw and picks which limb gets which track.
+let batSideSign = 1; // 1 = batting left-handed (as authored), -1 = right-handed (mirrored)
+
+function setBatterHandedness(batHand) {
+  const s = batHand === 'R' ? -1 : 1;
+  if (s === batSideSign) return;
+  const wasInBox = Math.hypot(batterMesh.position.x - batterPos.x,
+                              batterMesh.position.z - batterPos.z) < 2;
+  batSideSign = s;
+  batterPos.x = HOME.x - s * (lhBoxGap + lhBoxWidth / 2);
+  batterRec.yaw = BATTER_STANCE_YAW * s;
+  // The bat rides in the top hand: the rightElbow node for a lefty, leftElbow
+  // for a righty (node names mirror anatomy). Its catcher-side nudge mirrors too.
+  const topElbow = s === 1 ? batterRec.doll.rightElbow : batterRec.doll.leftElbow;
+  topElbow.add(batGroup); // add() reparents, pulling it off the old elbow
+  batGroup.position.x = 0.1 * s;
+  // Un-cross whichever lead arm the previous stance had reaching over the chest.
+  batterRec.doll.leftArm.rotation.z = 0.10;
+  batterRec.doll.rightArm.rotation.z = -0.10;
+  // If he's standing in for the pitch (not off running the bases), walk the
+  // swap over to the other box immediately.
+  if (wasInBox) batterMesh.position.copy(batterPos);
+}
 
 // ---------- Swing mechanic: Enter swings the bat and checks for a ball collision ----------
 const swing = {
@@ -986,26 +1075,26 @@ const runner = {
 };
 // ---------- Rosters (1 = worst, 10 = best): Speed, Throwing, Hitting ----------
 const homeRoster = [
-  { name: 'Cy Young',         pos: 'P',   speed: 7,  throwing: 9,  hitting: 5 },
-  { name: 'Yogi Berra',       pos: 'C',   speed: 5,  throwing: 10, hitting: 8 },
-  { name: 'Lou Gehrig',       pos: '1B',  speed: 7,  throwing: 8,  hitting: 9 },
-  { name: 'Rogers Hornsby',   pos: '2B',  speed: 7,  throwing: 8,  hitting: 7 },
-  { name: 'George Brett',     pos: '3B',  speed: 6,  throwing: 8,  hitting: 9 },
-  { name: 'Honus Wagner',     pos: 'SS',  speed: 7,  throwing: 9,  hitting: 8 },
-  { name: 'Rickey Henderson', pos: 'LF',  speed: 10, throwing: 6,  hitting: 6 },
-  { name: 'Willie Mays',      pos: 'CF',  speed: 8,  throwing: 8,  hitting: 8 },
-  { name: 'Babe Ruth',        pos: 'RF',  speed: 5,  throwing: 7,  hitting: 10 },
+  { name: 'Cy Young',         pos: 'P',   speed: 7,  throwing: 9,  hitting: 5,  throwHand: 'R', batHand: 'R' },
+  { name: 'Yogi Berra',       pos: 'C',   speed: 5,  throwing: 10, hitting: 8,  throwHand: 'R', batHand: 'L' },
+  { name: 'Lou Gehrig',       pos: '1B',  speed: 7,  throwing: 8,  hitting: 9,  throwHand: 'L', batHand: 'L' },
+  { name: 'Rogers Hornsby',   pos: '2B',  speed: 7,  throwing: 8,  hitting: 7,  throwHand: 'R', batHand: 'R' },
+  { name: 'George Brett',     pos: '3B',  speed: 6,  throwing: 8,  hitting: 9,  throwHand: 'R', batHand: 'L' },
+  { name: 'Honus Wagner',     pos: 'SS',  speed: 7,  throwing: 9,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Rickey Henderson', pos: 'LF',  speed: 10, throwing: 6,  hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Willie Mays',      pos: 'CF',  speed: 8,  throwing: 8,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Babe Ruth',        pos: 'RF',  speed: 5,  throwing: 7,  hitting: 10, throwHand: 'L', batHand: 'L' },
 ];
 const visitorRoster = [
-  { name: 'Greg Maddux',      pos: 'P',   speed: 6, throwing: 10, hitting: 6 },
-  { name: 'Gary Carter',      pos: 'C',   speed: 7, throwing: 7,  hitting: 8 },
-  { name: 'Pete Rose',        pos: '1B',  speed: 8, throwing: 6,  hitting: 10 },
-  { name: 'Jackie Robinson',  pos: '2B',  speed: 8, throwing: 6,  hitting: 8 },
-  { name: 'Mike Schmidt',     pos: '3B',  speed: 7, throwing: 7,  hitting: 7 },
-  { name: 'Ozzie Smith',      pos: 'SS',  speed: 8, throwing: 8,  hitting: 6 },
-  { name: 'Barry Bonds',      pos: 'LF',  speed: 8, throwing: 8,  hitting: 8 },
-  { name: 'Dale Murphy',      pos: 'CF',  speed: 7, throwing: 7,  hitting: 8 },
-  { name: 'Hank Aaron',       pos: 'RF',  speed: 7, throwing: 7,  hitting: 9 },
+  { name: 'Greg Maddux',      pos: 'P',   speed: 6, throwing: 10, hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Gary Carter',      pos: 'C',   speed: 7, throwing: 7,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Pete Rose',        pos: '1B',  speed: 8, throwing: 6,  hitting: 10, throwHand: 'R', batHand: 'R' },
+  { name: 'Jackie Robinson',  pos: '2B',  speed: 8, throwing: 6,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Mike Schmidt',     pos: '3B',  speed: 7, throwing: 7,  hitting: 7,  throwHand: 'R', batHand: 'R' },
+  { name: 'Ozzie Smith',      pos: 'SS',  speed: 8, throwing: 8,  hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Barry Bonds',      pos: 'LF',  speed: 8, throwing: 8,  hitting: 8,  throwHand: 'L', batHand: 'L' },
+  { name: 'Dale Murphy',      pos: 'CF',  speed: 7, throwing: 7,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Hank Aaron',       pos: 'RF',  speed: 7, throwing: 7,  hitting: 9,  throwHand: 'R', batHand: 'R' },
 ];
 
 // Batting order: everyone bats in roster order, with the pitcher batting last.
@@ -1040,7 +1129,7 @@ const FIELDER_CATCH_RADIUS = 2.0;  // how close a fielder must be to catch a fly
 const FIELDER_FIELD_RADIUS = 2.6;  // how close a fielder must be to field a grounder
 const FIELDER_CATCH_HEIGHT = CAPSULE_TOTAL_HEIGHT * 1.6; // max reachable height for a catch
 const OUTFIELD_POSITIONS = ['LF', 'CF', 'RF'];
-const OUTFIELDER_REACTION_DELAY = 0.5; // seconds before an outfielder reads the ball and breaks for the landing spot
+const OUTFIELDER_REACTION_DELAY = 0.25; // seconds before an outfielder reads the ball and breaks for the landing spot
 
 // Standing spots in feet from home plate (+Z toward center field, +X toward 3B/left field)
 const FIELD_SPOTS_FT = {
@@ -1063,33 +1152,39 @@ const fielders = Object.keys(FIELD_SPOTS_FT).map((posKey) => {
   const spot = FIELD_SPOTS_FT[posKey];
   const homePos = new THREE.Vector3(spot.x * FT, standHeight, HOME.z + spot.z * FT);
   const rec = makePlayerDoll(HOME_COLOR, 'home');
-  // Fielders wear the mitt on their (anatomical) left hand and throw righty —
-  // the rightElbow node is the doll's left hand (node names mirror anatomy).
-  addGlove(rec.doll.rightElbow);
+  // Starts righty (throwSign 1, glove on the rightElbow node); refreshActivePlayers
+  // calls setThrowHandedness() with the actual roster player's throwHand every
+  // time the fielding team swaps, reparenting the glove and mirroring his throw.
+  const glove = new THREE.Group();
+  addGlove(glove);
+  rec.doll.rightElbow.add(glove);
+  rec.glove = glove;
   rec.wrapper.position.copy(homePos);
   scene.add(rec.wrapper);
   return { posKey, mesh: rec.wrapper, rec, homePos, attrs: null };
 });
 
-// Fielder speed rating -> chase speed (1 -> 11ft/s, 10 -> 22ft/s)
+// Fielder speed rating -> chase speed (1 -> 15ft/s, 10 -> 28ft/s)
 function fielderRatingToChaseSpeed(rating) {
-  const ftPerSec = 11 + ((rating - 1) / 9) * (22 - 11);
+  const ftPerSec = 15 + ((rating - 1) / 9) * (28 - 15);
   return ftPerSec * FT;
 }
 
 // Refreshes which players are active (pitcher on the mound, fielders, current
 // batter) to match the current half-inning and batting order.
 function refreshActivePlayers() {
-  pitcherAttributes = currentPitcherAttrs(); 
+  pitcherAttributes = currentPitcherAttrs();
   batterAttributes = currentBatterAttrs();
-  nameCardPitcherEl.innerHTML = buildCardHTML(pitcherAttributes);
-  nameCardBatterEl.innerHTML = buildCardHTML(batterAttributes);
+  setBatterHandedness(batterAttributes.batHand); // step into the box on his natural side
+  updatePlayerBug();
 
   const fielding = fieldingTeam();
   const fieldColor = fielding === teams.home ? HOME_COLOR : VISITOR_COLOR;
   pitcherRec.doll.teamMat.color.set(fieldColor); // jersey + cap + sleeves take the team color
+  setThrowHandedness(pitcherRec, pitcherAttributes.throwHand);
   for (const f of fielders) {
     f.attrs = fielding.roster.find(p => p.pos === f.posKey);
+    setThrowHandedness(f.rec, f.attrs.throwHand);
     f.rec.doll.teamMat.color.set(fieldColor);
   }
 
@@ -1131,9 +1226,16 @@ function updateBaseRunnerAnim(dt) {
   let target;
   if (runnerAnim.forcedAdvance) {
     target = 1; // finishing a deferred advance to the next base, then we commit occupancy
-  } else if (throwToFirst.active || groundPlay.active || firstBasePutout.active) {
+  } else if (groundPlay.active) {
+    // A force play is on — and a force play only ever launches when the lead
+    // runner IS beaten (pre-decided). Hold the advancing runners a step short
+    // of the bag so the throw always visibly arrives first; the doomed runner
+    // is removed at resolution having never reached it.
+    target = 0.85;
+  } else if (throwToFirst.active || firstBasePutout.active) {
     // Infield grounder being fielded/thrown: the runners are committed and keep going
     // toward the next base (never retreating) until the out/safe call resolves it.
+    // (Only the batter can be out on these plays — everyone else is safe.)
     target = 1;
   } else if (!inPlay.active) {
     target = 0; // between pitches: standing on the bag
@@ -1811,44 +1913,24 @@ function recordHomeRun() {
   endAtBat();
 }
 
-// ---------- Player name cards (shown briefly above each player at the start of a play) ----------
-const nameCardPitcherEl = document.getElementById('nameCardPitcher');
-const nameCardBatterEl = document.getElementById('nameCardBatter');
+// ---------- Player bug (top-left HUD, opposite the score bug): always shows the ----------
+// ---------- current pitcher and batter, plus any runners on base. ----------
+const playerBugEl = document.getElementById('playerBug');
 
-function buildCardHTML(attrs) {
-  return `<div class="name-card-title">${attrs.name}</div>` +
-    `Throwing: ${attrs.throwing} &nbsp; Speed: ${attrs.speed} &nbsp; Hitting: ${attrs.hitting}`;
+function updatePlayerBug() {
+  const b = gameState.bases;
+  let html =
+    `<div class="player-bug-row"><span class="player-bug-role">Pitcher</span><span>${pitcherAttributes.name}</span></div>` +
+    `<div class="player-bug-row"><span class="player-bug-role">Batter</span><span>${batterAttributes.name}</span></div>`;
+  if (b.first || b.second || b.third) {
+    html += `<div class="player-bug-divider"></div>`;
+    if (b.first)  html += `<div class="player-bug-row"><span class="player-bug-role">1B:</span><span>${b.first.name}</span></div>`;
+    if (b.second) html += `<div class="player-bug-row"><span class="player-bug-role">2B:</span><span>${b.second.name}</span></div>`;
+    if (b.third)  html += `<div class="player-bug-row"><span class="player-bug-role">3B:</span><span>${b.third.name}</span></div>`;
+  }
+  playerBugEl.innerHTML = html;
 }
 refreshActivePlayers();
-
-const nameCards = { visible: false, hideTimer: null };
-
-function showNameCards() {
-  nameCards.visible = true;
-  nameCardPitcherEl.style.opacity = '1';
-  nameCardBatterEl.style.opacity = '1';
-  clearTimeout(nameCards.hideTimer);
-  nameCards.hideTimer = setTimeout(() => {
-    nameCardPitcherEl.style.opacity = '0';
-    nameCardBatterEl.style.opacity = '0';
-    nameCards.visible = false;
-  }, 2000);
-}
-
-function positionCardAbove(el, worldPos, heightAbove) {
-  const p = new THREE.Vector3(worldPos.x, worldPos.y + heightAbove, worldPos.z);
-  p.project(camera);
-  const x = (p.x * 0.5 + 0.5) * innerWidth;
-  const y = (-p.y * 0.5 + 0.5) * innerHeight;
-  el.style.left = `${x}px`;
-  el.style.top = `${y}px`;
-}
-
-function updateNameCards() {
-  if (!nameCards.visible) return;
-  positionCardAbove(nameCardPitcherEl, pitcherMesh.position, CAPSULE_TOTAL_HEIGHT * 0.7);
-  positionCardAbove(nameCardBatterEl, batterMesh.position, CAPSULE_TOTAL_HEIGHT * 0.7);
-}
 
 function resetPitchToPitcher() {
   if (runnerAnim.forcedAdvance) commitForcedAdvance(); // safety: settle any in-progress advance
@@ -2158,8 +2240,8 @@ function updateBallReturn(dt) {
   // The man taking this throw gets his glove up as it closes in — the cutoff
   // man on a relay leg, otherwise the pitcher (mitt on his other hand).
   if (dist < 8) {
-    if (ballReturn.waypoints.length > 1 && ballReturn.relayFielder) ballReturn.relayFielder.rec.reach = 'right';
-    else pitcherRec.reach = 'left';
+    if (ballReturn.waypoints.length > 1 && ballReturn.relayFielder) ballReturn.relayFielder.rec.reach = gloveReachSide(ballReturn.relayFielder.rec);
+    else pitcherRec.reach = gloveReachSide(pitcherRec);
   }
   if (dist < 0.3) {
     ballMesh.position.copy(target);
@@ -2172,7 +2254,7 @@ function updateBallReturn(dt) {
       if (done) done();
       // Landed in the pitcher's glove: pin it there briefly (he may still be
       // walking back to the mound) and let it tuck away until the next pitch.
-      else showBallInGlove(pitcherRec, 0.35, pitcherRec.doll.leftElbow);
+      else showBallInGlove(pitcherRec, 0.35);
     } else {
       // Reached a relay point (the cutoff man) — into his mitt for the beat
       // before the next throw.
@@ -2232,10 +2314,9 @@ const BAG_COVER_RADIUS = 1.3;
 function updateThrowToFirst(dt) {
   if (!throwToFirst.active) return;
   // Whoever's taking the throw at first has his glove up for it — through the
-  // fielder's gather AND the flight. (The pitcher covering wears his mitt on
-  // the other hand — he's a lefty.)
-  if (pitcherCoveringFirst) pitcherRec.reach = 'left';
-  else fielderByPos('1B').rec.reach = 'right';
+  // fielder's gather AND the flight, on whichever hand his mitt actually rides.
+  if (pitcherCoveringFirst) pitcherRec.reach = gloveReachSide(pitcherRec);
+  else fielderByPos('1B').rec.reach = gloveReachSide(fielderByPos('1B').rec);
   if (throwToFirst.delay > 0) { // gathering: the ball's in his mitt
     throwToFirst.delay -= dt;
     if (throwToFirst.delay > 0) return;
@@ -2272,9 +2353,8 @@ function onThrowReachedFirst() {
     : (firstBaseman && Math.hypot(firstBaseman.mesh.position.x - FIRST_COVER_POS.x,
                                   firstBaseman.mesh.position.z - FIRST_COVER_POS.z) < BAG_COVER_RADIUS);
   nudgeBobble((caughtByPitcher ? pitcherRec : firstBaseman.rec).doll, 1.2); // taking the throw
-  // The throw lands in the receiver's mitt (the pitcher wears his on the
-  // other hand — he's a lefty) and tucks away until it's thrown/carried back.
-  if (caughtByPitcher) showBallInGlove(pitcherRec, 0.6, pitcherRec.doll.leftElbow);
+  // The throw lands in the receiver's mitt and tucks away until it's thrown/carried back.
+  if (caughtByPitcher) showBallInGlove(pitcherRec, 0.6);
   else showBallInGlove(firstBaseman.rec, RELAY_PAUSE);
   if (throwToFirst.out && onBag) {
     runner.active = false; // thrown out before reaching the bag
@@ -2445,7 +2525,7 @@ function updateGroundPlay(dt) {
   // The man covering the target bag has his glove up for the incoming throw
   // through the thrower's gather and the flight.
   const currentHop = groundPlay.hops[groundPlay.index];
-  if (currentHop) currentHop.cover.rec.reach = 'right';
+  if (currentHop) currentHop.cover.rec.reach = gloveReachSide(currentHop.cover.rec);
   if (groundPlay.delay > 0) { // gathering: the ball's in the fielder's mitt
     groundPlay.delay -= dt;
     if (groundPlay.delay > 0) return;
@@ -2466,7 +2546,7 @@ function updateGroundPlay(dt) {
     return;
   }
   releaseBallFromGlove(); // the throw is in flight — ball out of the mitt and back in sight
-  hop.cover.rec.reach = 'right'; // the cover man has his glove up for the throw
+  hop.cover.rec.reach = gloveReachSide(hop.cover.rec); // the cover man has his glove up for the throw
   // Aim at the cover fielder's glove (his live position), so a still-arriving cover
   // man is thrown to wherever he is, not to an empty bag.
   const target = new THREE.Vector3(glove.x, ballHoldHeight, glove.z);
@@ -2760,6 +2840,8 @@ function infieldCoverSpot(posKey) {
 // flight so a ball landing between two fielders doesn't make the "closest" flip
 // frame to frame and draw several of them toward it.
 let infieldFlyCatcher = null;
+// Same idea, for which outfielder has called for a fly ball out to the grass.
+let outfieldFlyCatcher = null;
 
 // Latched true once the first baseman is the infielder closest to a grounder: it's
 // his ball, so he charges it instead of camping on the bag, then makes the putout
@@ -2805,13 +2887,13 @@ function updateFielders(dt) {
   if (chasing && !inPlay.touchedGround && !inPlay.touchedFence && inPlay.velocity.y < 0) {
     for (const f of fielders) {
       if (Math.hypot(ballMesh.position.x - f.mesh.position.x,
-                     ballMesh.position.z - f.mesh.position.z) < 3.5) f.rec.reach = 'right';
+                     ballMesh.position.z - f.mesh.position.z) < 3.5) f.rec.reach = gloveReachSide(f.rec);
     }
   }
   // The catcher presents his mitt as the pitch comes in.
   if (pitch.inFlight) {
     const c = fielderByPos('C');
-    if (ballMesh.position.distanceTo(c.mesh.position) < 8) c.rec.reach = 'right';
+    if (ballMesh.position.distanceTo(c.mesh.position) < 8) c.rec.reach = gloveReachSide(c.rec);
   }
   // Outfielders read the ball off the bat and break toward where it's going to land.
   const landingSpot = (chasing && !inPlay.touchedGround && !inPlay.touchedFence) ? predictLandingSpot() : null;
@@ -2836,6 +2918,22 @@ function updateFielders(dt) {
     infieldFlyCatcher = null; // play's not a pop fly (any more): clear for next time
   }
   const flyCatcher = infieldFlyCatcher;
+  // A fly ball out to the grass: only the outfielder actually closest to the
+  // landing spot breaks for it. Without this, every outfielder targeted the
+  // same spot — so on a can-of-corn to (say) center, the corner outfielders
+  // sprinted all the way across too, often arriving just as it landed. Latch
+  // the same way as the infield fly catcher above, so a ball landing between
+  // two outfielders doesn't flip-flop who's "closest" and pull both of them in.
+  if (landingSpot) {
+    if (!outfieldFlyCatcher) {
+      const pool = fielders.filter(f => OUTFIELD_POSITIONS.includes(f.posKey));
+      outfieldFlyCatcher = pool.reduce((a, b) =>
+        Math.hypot(a.mesh.position.x - landingSpot.x, a.mesh.position.z - landingSpot.z) <=
+        Math.hypot(b.mesh.position.x - landingSpot.x, b.mesh.position.z - landingSpot.z) ? a : b);
+    }
+  } else {
+    outfieldFlyCatcher = null; // no fly in the air right now: clear for next time
+  }
   // On an infield grounder the first baseman plays the bag to take the throw.
   const infieldGrounder = chasing && inPlay.touchedGround && !inPlay.touchedFence && !outfieldPlay;
   const firstBaseCoverActive = throwToFirst.active || infieldGrounder;
@@ -2876,10 +2974,16 @@ function updateFielders(dt) {
         // Pop fly to the infield — hold; the infielders make the catch.
         target = f.homePos;
       } else if (landingSpot) {
-        // Hold position for a beat while reading the ball off the bat, then break for the landing spot.
-        target = hitClock < OUTFIELDER_REACTION_DELAY
-          ? f.homePos
-          : new THREE.Vector3(landingSpot.x, f.mesh.position.y, landingSpot.z);
+        if (f === outfieldFlyCatcher) {
+          // Hold position for a beat while reading the ball off the bat, then break for the landing spot.
+          target = hitClock < OUTFIELDER_REACTION_DELAY
+            ? f.homePos
+            : new THREE.Vector3(landingSpot.x, f.mesh.position.y, landingSpot.z);
+        } else {
+          // Someone else has already called for this one — hold ground instead
+          // of sprinting across the outfield to a ball that isn't his.
+          target = f.homePos;
+        }
       } else {
         target = new THREE.Vector3(ballMesh.position.x, f.mesh.position.y, ballMesh.position.z);
       }
@@ -2921,6 +3025,12 @@ function updateFielders(dt) {
         return;
       }
       if ((inPlay.touchedGround || inPlay.touchedFence) && horizDist < FIELDER_FIELD_RADIUS) {
+        // A ball called a hit must find the outfield grass: infielders never
+        // glove it on its way through (with the quicker defense they'd
+        // otherwise cut off called singles and turn them into infield outs) —
+        // it skips past and the outfield plays it, so the rolled outcome
+        // stands no matter how fast the defense is.
+        if (inPlay.calledBases >= 1 && !isOutfielder && !inPlay.touchedFence) continue;
         fieldBall(f, false);
         return;
       }
@@ -2993,7 +3103,6 @@ function throwPitch() {
   if (gameEnded) return; // final out is in — no more pitches
   if (pitch.inFlight || pitch.windingUp || pitch.resetting || inPlay.active) return;
   if (inningTransition.phase !== 'none') return; // teams are still swapping sides
-  showNameCards();
   pitch.windingUp = true;
   ballMesh.visible = false; // tucked into the glove for the windup — reappears out of the hand at release
   triggerDollAction(pitcherRec, 'pitch');
@@ -3062,15 +3171,6 @@ const camCurrentLookAt = camBattingLookAt.clone();
 camera.position.copy(camBattingPos);
 camera.lookAt(camCurrentLookAt);
 
-// How far from home plate counts as "still in the infield" — just past the bases.
-const INFIELD_RADIUS = BASE_DIST * 1.6;
-
-const followCam = {
-  mode: 'tracking',   // 'tracking' while the ball is in the infield, 'zoomingOut' once it leaves
-  zoomOutElapsed: 0,
-  anchorLookAt: new THREE.Vector3(),
-};
-
 function updateCamera(dt) {
   let desiredPos, desiredLookAt, lerpSpeed;
 
@@ -3083,50 +3183,64 @@ function updateCamera(dt) {
     );
     desiredLookAt = batterMesh.position;
     lerpSpeed = 3;
-    followCam.mode = 'tracking';
   } else if (inPlay.active) {
-    const distFromHome = Math.hypot(ballMesh.position.x - HOME.x, ballMesh.position.z - HOME.z);
-
-    if (followCam.mode === 'tracking' && distFromHome > INFIELD_RADIUS) {
-      // Ball just left the infield — stop chasing it and start a slow continuous zoom-out.
-      followCam.mode = 'zoomingOut';
-      followCam.zoomOutElapsed = 0;
-      followCam.anchorLookAt.copy(ballMesh.position);
-    }
-
-    if (followCam.mode === 'tracking') {
-      // Wide, high angle over the ball while it's still around the infield.
-      desiredPos = new THREE.Vector3(
-        ballMesh.position.x,
-        ballMesh.position.y + 48 * FT,
-        ballMesh.position.z - 42 * FT
-      );
-      desiredLookAt = ballMesh.position;
-      lerpSpeed = 4;
-    } else {
-      // Slowly keep pulling back from the spot where the ball left the infield.
-      followCam.zoomOutElapsed += dt;
-      const growth = 1 + followCam.zoomOutElapsed * 0.12; // gentle, continuous zoom-out
-      desiredPos = new THREE.Vector3(
-        followCam.anchorLookAt.x,
-        followCam.anchorLookAt.y + 55 * FT * growth,
-        followCam.anchorLookAt.z - 50 * FT * growth
-      );
-      desiredLookAt = followCam.anchorLookAt;
-      lerpSpeed = 1.5;
-    }
+    // One continuous framing for every ball in play — no infield/outfield
+    // mode switch (a discrete flip is what caused the zoom snapping). The
+    // shot centers on the average of home plate, the ball, and first base
+    // (home anchors the frame; first is where nearly every play's throw ends
+    // up), and pulls back based on how far those three have spread apart.
+    // The ball is inside the frame by construction, so the camera never has
+    // to chase it: as a drive carries to the outfield the center drifts at
+    // only a third of the ball's speed (the camera barely MOVES) while the
+    // spread — and with it the height — keeps growing (it ZOOMS instead),
+    // following the ball out and back in again on the return throws, all on
+    // one smooth curve. Above the infield-scale knee the pull-back grows at
+    // half rate so deep flies widen gently rather than ballooning.
+    const cx = (HOME.x + ballMesh.position.x + FIRST.x) / 3;
+    const cz = (HOME.z + ballMesh.position.z + FIRST.z) / 3;
+    const spread = Math.max(
+      Math.hypot(HOME.x - cx, HOME.z - cz),
+      Math.hypot(ballMesh.position.x - cx, ballMesh.position.z - cz),
+      Math.hypot(FIRST.x - cx, FIRST.z - cz)
+    );
+    const raw = spread * 1.7;
+    const knee = 95 * FT; // infield plays all resolve below this height
+    const height = Math.max(45 * FT, raw <= knee ? raw : knee + (raw - knee) * 0.5);
+    // Well behind the framing center (0.85x height): an elevated three-quarter
+    // angle between the low behind-the-plate pitch view and a straight overhead.
+    desiredPos = new THREE.Vector3(cx, height, cz - height * 0.85);
+    desiredLookAt = new THREE.Vector3(cx, 0, cz);
+    lerpSpeed = 2.5; // glide, don't whip
   } else {
     // Back to the tight batting view, behind home plate.
     desiredPos = camBattingPos;
     desiredLookAt = camBattingLookAt;
-    followCam.mode = 'tracking';
     lerpSpeed = 3;
   }
 
   const alpha = 1 - Math.pow(0.001, dt * (lerpSpeed / 3));
-  camera.position.lerp(desiredPos, alpha);
-  camCurrentLookAt.lerp(desiredLookAt, alpha);
+  if (!inPlay.active && !inPlay.homerunCalled) {
+    // Returning to the batting view between plays: the plain exponential lerp
+    // covers most of a big jump in its first few frames (a hard visible snap,
+    // worst coming off the home-run follow cam parked right at the plate).
+    // Cap the per-second travel so the way back is a steady, gentle pan that
+    // the lerp then eases to a stop at the end.
+    const maxStep = 14 * dt; // world units/s pan cap on the way back
+    camStepToward(camera.position, desiredPos, alpha, maxStep);
+    camStepToward(camCurrentLookAt, desiredLookAt, alpha, maxStep);
+  } else {
+    camera.position.lerp(desiredPos, alpha);
+    camCurrentLookAt.lerp(desiredLookAt, alpha);
+  }
   camera.lookAt(camCurrentLookAt);
+}
+
+// One eased step of `current` toward `target`: the usual exponential lerp,
+// but never moving more than maxStep in a single frame.
+function camStepToward(current, target, alpha, maxStep) {
+  const step = new THREE.Vector3().subVectors(target, current).multiplyScalar(alpha);
+  if (step.length() > maxStep) step.setLength(maxStep);
+  current.add(step);
 }
 
 const clock = new THREE.Clock();
@@ -3165,6 +3279,12 @@ function animate() {
       // Catcher gathers the pitch, then throws it back to the pitcher. pitch.resetting
       // stays true (blocking the next pitch) until the throw lands in his hand.
       if (inningTransition.phase === 'none') {
+        // Pin the ball into the catcher's mitt for the gather beat instead of
+        // leaving it sitting wherever the pitch happened to arrive (which reads
+        // as the ball floating inside his body) — it tucks out of sight the
+        // instant the beat ends and reappears out of his throwing hand when
+        // startCatcherReturn fires, in lockstep.
+        showBallInGlove(fielderByPos('C').rec, 0.3);
         setTimeout(startCatcherReturn, 300); // brief beat before the catcher throws it back
       } else {
         pitch.resetting = false; // strikeout ended the inning — the teams are swapping
@@ -3185,10 +3305,9 @@ function animate() {
   updateDolls(dt); // after all movers: run cycles, facing, actions, head bobble
   updateBallInGlove(dt); // pin a possessed ball to its holder's mitt (then tuck it away)
   updateCamera(dt);
-  updateNameCards();
+  updatePlayerBug(); // base occupancy can change from several code paths — cheap enough to just refresh every frame
 
   requestAnimationFrame(animate);
   renderer.render(scene, camera);
 }
 animate();
-showNameCards(); // show once at the very start, before the first pitch
