@@ -540,7 +540,14 @@ function releaseDollGhost(rec) {
   });
 }
 
-const DOLL_ACTION_DUR = { swing: 0.85, throw: 0.5, field: 0.55, catch: 0.6, pitch: 1.2 };
+const DOLL_ACTION_DUR = { swing: 0.85, throw: 0.9, field: 0.55, catch: 0.6, pitch: 1.2 };
+// The throw's release point: how far into the 0.9s throw action the arm is at
+// full overhand extension and the ball actually leaves the hand. Throw systems
+// trigger the action this long BEFORE launching the ball, so the windup
+// (reach-back, cock behind the ear) plays out while the ball is still in the
+// mitt — launching at trigger time made every throw read as an underhand
+// flick, with the ball gone while the arm was still down at the hip.
+const THROW_RELEASE_TIME = 0.3; // seconds; = keyframe 0.333 of the 0.9s action
 
 // Keyframe helpers: smooth-eased interpolation between phases of an action.
 function smoothstep(u) { return u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u); }
@@ -734,6 +741,15 @@ function updateDolls(dt) {
         // both the rotation direction and which channel the sign flip applies to.
         if (rec.action === 'pitch') rec.yaw += PITCH_END_YAW * -rec.throwSign;
         else if (rec.action === 'swing') rec.yaw += SWING_END_YAW * batSideSign;
+        else if (rec.action === 'throw') {
+          // The overhand arc runs the throwing shoulder's angle continuously
+          // up past vertical (ending around +5.7 rad); wrap it back into
+          // (-PI, PI] so the rest easing settles the short way instead of
+          // windmilling the arm backward through a full circle.
+          const wrapAngle = (v) => ((v + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+          doll.leftArm.rotation.x = wrapAngle(doll.leftArm.rotation.x);
+          doll.rightArm.rotation.x = wrapAngle(doll.rightArm.rotation.x);
+        }
         rec.action = null;
       } else if (rec.action === 'pitch') {
         // Full windup-and-delivery, driven by the keyframe tracks above.
@@ -768,24 +784,53 @@ function updateDolls(dt) {
         yawOffset = track(SWING_TRACKS.yaw, t) * batSideSign;
         lean = track(SWING_TRACKS.lean, t);
       } else if (rec.action === 'throw') {
-        // A fielder's quick snap throw: the throwing arm cocks behind with the
-        // forearm folded, whips over as the elbow snaps straight, recovers;
-        // the gloved hand leads and tucks, with a little body pivot so it
-        // isn't just an arm flailing. Authored for a righty (throwing arm =
+        // A fielder's full overhand throw, in phases (release at t=0.333,
+        // where THROW_RELEASE_TIME launches the ball). The ball NEVER swings
+        // down-and-back on a straight arm (that reads as an underhand
+        // backswing) — the load happens bent at the elbow, at waist level and
+        // above only:
+        //   0    - .12: set — the upper arm drops 45° down-back with the
+        //               ELBOW BENT so the forearm (and ball) sit LEVEL with
+        //               the ground, body coiling slightly away from the target
+        //   .12  - .24: cock — the forearm swings up from the elbow, back
+        //               past the shoulder, carrying the ball up behind the
+        //               throwing-side ear
+        //   .24 - .333: fire — the arm whips OVER THE TOP (the shoulder angle
+        //               runs continuously up past vertical), the elbow
+        //               snapping to full extension 45° above the shoulder in
+        //               front at release
+        //   .333 -  1 : follow through — the arm carries down and ACROSS the
+        //               body toward the opposite hip (a lateral z-swing of the
+        //               shoulder), torso bending at the waist over the front
+        //               side, then everything settles back toward rest.
+        // The shoulder track climbs monotonically through +PI (straight up)
+        // and ends past +2PI-side equivalents; the action-completion handler
+        // wraps it back into (-PI, PI] so the rest easing doesn't windmill
+        // the arm backward. Authored for a righty (throwing arm =
         // leftArm/leftElbow, the anatomical right — node names mirror
-        // anatomy); a lefty swaps which arm gets which track, and the body
-        // pivot reverses direction.
-        const main   = track([[0, 0], [0.3, 0.7], [0.55, -2.2], [1, 0]], t);
-        const mainElb = track([[0, 0], [0.3, -1.2], [0.55, -0.15], [1, 0]], t);
-        const off    = track([[0, 0], [0.3, -0.7], [0.6, -0.1], [1, 0]], t);
-        const offElb = track([[0, 0], [0.3, -0.5], [0.6, 0], [1, 0]], t);
+        // anatomy); a lefty swaps which arm gets which track and mirrors the
+        // body pivot and cross-body sweep.
+        const main    = track([[0, 0], [0.12, 0.78], [0.24, 2.5], [0.333, 3.92], [0.6, 5.0], [1, 5.7]], t);
+        const mainElb = track([[0, 0], [0.12, -2.35], [0.24, -0.9], [0.333, -0.05], [0.6, -0.5], [1, -0.4]], t);
+        const off     = track([[0, 0], [0.11, -0.9], [0.28, -1.2], [0.55, -0.3], [1, 0]], t); // glove arm leads, then tucks
+        const offElb  = track([[0, 0], [0.11, -0.6], [0.3, -0.8], [0.6, -0.2], [1, 0]], t);
         const righty = rec.throwSign === 1;
         armL = righty ? main : off;
         elbL = righty ? mainElb : offElb;
         armR = righty ? off : main;
         elbR = righty ? offElb : mainElb;
-        yawOffset = track([[0, 0], [0.3, -0.55], [0.6, 0.15], [1, 0]], t) * rec.throwSign;
-        lean = track([[0, 0], [0.55, 0.2], [1, 0]], t);
+        // Hips coil closed on the reach-back, fire through at release, settle.
+        yawOffset = track([[0, 0], [0.11, 0.3], [0.24, 0.15], [0.4, -0.7], [0.75, -0.3], [1, 0]], t) * rec.throwSign;
+        // Waist: slight arch back through the cock, bend forward through the follow-through.
+        lean = track([[0, 0], [0.11, -0.18], [0.28, -0.1], [0.45, 0.42], [0.8, 0.22], [1, 0.05]], t);
+        // Cross-body follow-through: after release the throwing shoulder
+        // sweeps the arm laterally across the chest toward the opposite hip
+        // (rotation.z — pitching about x alone can't cross the body). Track
+        // is authored for the righty's leftArm node (rest z = +0.10) and
+        // mirrors through throwSign for a lefty's rightArm (rest z = -0.10).
+        const throwArm = righty ? doll.leftArm : doll.rightArm;
+        const zAcross = track([[0, 0.1], [0.333, 0.1], [0.55, 0.8], [0.85, 0.3], [1, 0.1]], t) * rec.throwSign;
+        throwArm.rotation.z += (zAcross - throwArm.rotation.z) * Math.min(1, dt * 28);
       } else if (rec.action === 'catch') {
         // Squeeze a fly ball: the gloved arm reaches up to meet the ball,
         // holds it a beat overhead, and comes back down. Glove arm is
@@ -809,13 +854,18 @@ function updateDolls(dt) {
         crouch = 0.12 * dip;
       }
     }
+    // The throw's windup phases are fast (full reach-back to release in 0.3s);
+    // the standard easing rate lags them into mush — the arm would only get
+    // halfway back and never reach the overhand extension before the ball
+    // leaves. Arms and torso chase their throw tracks at a much snappier rate.
+    const armEase = rec.action === 'throw' ? Math.min(1, dt * 28) : ease;
     doll.leftLeg.rotation.x += (legL - doll.leftLeg.rotation.x) * ease;
     doll.rightLeg.rotation.x += (legR - doll.rightLeg.rotation.x) * ease;
-    doll.leftArm.rotation.x += (armL - doll.leftArm.rotation.x) * ease;
-    doll.rightArm.rotation.x += (armR - doll.rightArm.rotation.x) * ease;
+    doll.leftArm.rotation.x += (armL - doll.leftArm.rotation.x) * armEase;
+    doll.rightArm.rotation.x += (armR - doll.rightArm.rotation.x) * armEase;
     // Joint limits: elbows only bend forward (≤ 0), knees only fold back (≥ 0).
-    doll.leftElbow.rotation.x += (Math.min(0, elbL) - doll.leftElbow.rotation.x) * ease;
-    doll.rightElbow.rotation.x += (Math.min(0, elbR) - doll.rightElbow.rotation.x) * ease;
+    doll.leftElbow.rotation.x += (Math.min(0, elbL) - doll.leftElbow.rotation.x) * armEase;
+    doll.rightElbow.rotation.x += (Math.min(0, elbR) - doll.rightElbow.rotation.x) * armEase;
     doll.leftKnee.rotation.x += (Math.max(0, kneeL) - doll.leftKnee.rotation.x) * ease;
     doll.rightKnee.rotation.x += (Math.max(0, kneeR) - doll.rightKnee.rotation.x) * ease;
     // The bat rides in the batter's top hand (parented to the forearm at the
@@ -847,7 +897,7 @@ function updateDolls(dt) {
       const leadArm = batSideSign === 1 ? doll.leftArm : doll.rightArm;
       leadArm.rotation.z += (batSideSign * (inStance ? 0.6 : 0.10) - leadArm.rotation.z) * ease;
     }
-    doll.root.rotation.x += (lean - doll.root.rotation.x) * ease;
+    doll.root.rotation.x += (lean - doll.root.rotation.x) * armEase; // waist bend keeps up with the throw
     doll.root.position.y += ((-standHeight - crouch) - doll.root.position.y) * ease;
     wrapper.rotation.y = rec.yaw + yawOffset;
 
@@ -954,13 +1004,18 @@ function launchThrowFrom(rec) {
 function updateBallInGlove(dt) {
   if (!ballInGlove.rec) return;
   ballInGlove.timeLeft -= dt;
-  // Pin the ball to the mitt (which may be mid-reach overhead in a catch).
-  ballMesh.position.copy(ballInGlove.node.localToWorld(new THREE.Vector3(0, -0.28, 0.18)));
-  if (ballInGlove.timeLeft <= 0) {
+  // The moment the holder starts his throw windup, the ball tucks away out of
+  // sight — a ball still visibly riding the mitt at hip height through the
+  // windup made every throw read as an underhand flick out of the glove. It
+  // reappears out of the throwing hand at the release (launchThrowFrom).
+  if (ballInGlove.rec.action === 'throw' || ballInGlove.timeLeft <= 0) {
     ballInGlove.rec = null;
     ballInGlove.node = null;
     ballMesh.visible = false; // tucked in the mitt until his throw shows it again
+    return;
   }
+  // Pin the ball to the mitt (which may be mid-reach overhead in a catch).
+  ballMesh.position.copy(ballInGlove.node.localToWorld(new THREE.Vector3(0, -0.28, 0.18)));
 }
 
 // ---------- Batter doll in the batter's box, holding a bat ----------
@@ -1085,6 +1140,26 @@ const homeRoster = [
   { name: 'Willie Mays',      pos: 'CF',  speed: 8,  throwing: 8,  hitting: 8,  throwHand: 'R', batHand: 'R' },
   { name: 'Babe Ruth',        pos: 'RF',  speed: 5,  throwing: 7,  hitting: 10, throwHand: 'L', batHand: 'L' },
 ];
+// Bench players available to sub in for the home team; not part of the starting lineup/batting order.
+const homeSubstitutes = [
+  { name: 'Carl Yastrzemski', pos: 'LF',  speed: 7, throwing: 8,  hitting: 9,  throwHand: 'R', batHand: 'L' },
+  { name: 'Tris Speaker',     pos: 'CF',  speed: 8, throwing: 9,  hitting: 9,  throwHand: 'L', batHand: 'L' },
+  { name: 'Al Kaline',        pos: 'RF',  speed: 7, throwing: 9,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Jimmie Foxx',      pos: '1B',  speed: 6, throwing: 8,  hitting: 10, throwHand: 'R', batHand: 'R' },
+  { name: 'Eddie Collins',    pos: '2B',  speed: 9, throwing: 7,  hitting: 8,  throwHand: 'R', batHand: 'L' },
+  { name: 'Brooks Robinson',  pos: '3B',  speed: 6, throwing: 9,  hitting: 7,  throwHand: 'R', batHand: 'R' },
+  { name: 'Cal Ripken Jr.',   pos: 'SS',  speed: 6, throwing: 8,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Carlton Fisk',     pos: 'C',   speed: 6, throwing: 9,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+];
+// Relief pitchers available to bring in for the home team.
+const homeBullpen = [
+  { name: 'Lefty Grove',      pos: 'P',   speed: 5, throwing: 10, hitting: 6,  throwHand: 'L', batHand: 'L' },
+  { name: 'Whitey Ford',      pos: 'P',   speed: 5, throwing: 9,  hitting: 6,  throwHand: 'L', batHand: 'L' },
+  { name: 'Jim Palmer',       pos: 'P',   speed: 5, throwing: 9,  hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Bob Feller',       pos: 'P',   speed: 6, throwing: 10, hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Early Wynn',       pos: 'P',   speed: 5, throwing: 9,  hitting: 7,  throwHand: 'R', batHand: 'R' },
+  { name: 'Lefty Gomez',      pos: 'P',   speed: 5, throwing: 9,  hitting: 6,  throwHand: 'L', batHand: 'L' },
+];
 const visitorRoster = [
   { name: 'Greg Maddux',      pos: 'P',   speed: 6, throwing: 10, hitting: 6,  throwHand: 'R', batHand: 'R' },
   { name: 'Gary Carter',      pos: 'C',   speed: 7, throwing: 7,  hitting: 8,  throwHand: 'R', batHand: 'R' },
@@ -1096,6 +1171,26 @@ const visitorRoster = [
   { name: 'Dale Murphy',      pos: 'CF',  speed: 7, throwing: 7,  hitting: 8,  throwHand: 'R', batHand: 'R' },
   { name: 'Hank Aaron',       pos: 'RF',  speed: 7, throwing: 7,  hitting: 9,  throwHand: 'R', batHand: 'R' },
 ];
+// Bench players available to sub in for the visiting team; not part of the starting lineup/batting order.
+const visitorSubstitutes = [
+  { name: 'Roy Campanella',   pos: 'C',   speed: 6, throwing: 9,  hitting: 8,  throwHand: 'R', batHand: 'R' },
+  { name: 'Jeff Bagwell',     pos: '1B',  speed: 7, throwing: 7,  hitting: 9,  throwHand: 'R', batHand: 'R' },
+  { name: 'Joe Morgan',       pos: '2B',  speed: 9, throwing: 8,  hitting: 8,  throwHand: 'R', batHand: 'L' },
+  { name: 'Chipper Jones',    pos: '3B',  speed: 7, throwing: 8,  hitting: 9,  throwHand: 'R', batHand: 'S' },
+  { name: 'Ernie Banks',      pos: 'SS',  speed: 6, throwing: 8,  hitting: 9,  throwHand: 'R', batHand: 'R' },
+  { name: 'Stan Musial',      pos: 'LF',  speed: 8, throwing: 8,  hitting: 10, throwHand: 'L', batHand: 'L' },
+  { name: 'Duke Snider',      pos: 'CF',  speed: 8, throwing: 9,  hitting: 9,  throwHand: 'R', batHand: 'L' },
+  { name: 'Roberto Clemente', pos: 'RF',  speed: 9, throwing: 10, hitting: 9,  throwHand: 'R', batHand: 'R' },
+];
+// Relief pitchers available to bring in for the visiting team.
+const visitorBullpen = [
+  { name: 'Tom Seaver',        pos: 'P',   speed: 5, throwing: 10, hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Sandy Koufax',      pos: 'P',   speed: 6, throwing: 10, hitting: 5,  throwHand: 'L', batHand: 'R' },
+  { name: 'Steve Carlton',     pos: 'P',   speed: 5, throwing: 10, hitting: 6,  throwHand: 'L', batHand: 'L' },
+  { name: 'Warren Spahn',      pos: 'P',   speed: 5, throwing: 9,  hitting: 7,  throwHand: 'L', batHand: 'L' },
+  { name: 'Juan Marichal',     pos: 'P',   speed: 6, throwing: 9,  hitting: 6,  throwHand: 'R', batHand: 'R' },
+  { name: 'Christy Mathewson', pos: 'P',   speed: 5, throwing: 9,  hitting: 7,  throwHand: 'R', batHand: 'R' },
+];
 
 // Batting order: everyone bats in roster order, with the pitcher batting last.
 function battingOrderFor(roster) {
@@ -1106,8 +1201,8 @@ function battingOrderFor(roster) {
 }
 
 const teams = {
-  home:    { roster: homeRoster,    battingOrder: battingOrderFor(homeRoster),    lineupIndex: 0 },
-  visitor: { roster: visitorRoster, battingOrder: battingOrderFor(visitorRoster), lineupIndex: 0 },
+  home:    { name: 'American League All-Stars', roster: homeRoster,    battingOrder: battingOrderFor(homeRoster),    lineupIndex: 0, substitutes: homeSubstitutes,    bullpen: homeBullpen },
+  visitor: { name: 'National League All-Stars', roster: visitorRoster, battingOrder: battingOrderFor(visitorRoster), lineupIndex: 0, substitutes: visitorSubstitutes, bullpen: visitorBullpen },
 };
 
 function battingTeam()  { return gameState.half === 'top' ? teams.visitor : teams.home; }
@@ -2150,7 +2245,9 @@ const RELAY_PAUSE = 0.5; // beat between the cutoff man catching it and throwing
 // when it lands, freeing the next pitch.
 function startCatcherReturn() {
   if (inningTransition.phase !== 'none') { pitch.resetting = false; return; }
-  triggerDollAction(fielderByPos('C').rec, 'throw');
+  // The windup was already triggered when the pitch was caught (see the pitch
+  // landing in animate()); by now the arm is at the top — release the ball.
+  if (fielderByPos('C').rec.action !== 'throw') triggerDollAction(fielderByPos('C').rec, 'throw');
   launchThrowFrom(fielderByPos('C').rec); // the return leaves his throwing hand
   ballReturn.waypoints = [pitcherHandPos()];
   ballReturn.speed = throwingRatingToThrowSpeed(fielderByPos('C').attrs.throwing);
@@ -2175,8 +2272,11 @@ function pitcherHandPos() {
 function startBallReturn(fielder, initialPause = 0) {
   if (inningTransition.phase !== 'none') return; // side retired: the ball leaves with the teams
   if (initialPause === 0) {
-    triggerDollAction(fielder.rec, 'throw'); // throwing right away (else the pause release animates it)
-    launchThrowFrom(fielder.rec);
+    // "Throwing right away" still gets the overhand windup: start the action
+    // now and hold the ball the release-lead so it leaves at the top of the
+    // arc (updateBallReturn's pause expiry does the launch).
+    triggerDollAction(fielder.rec, 'throw');
+    initialPause = THROW_RELEASE_TIME;
   }
   const waypoints = [];
   let relayFielder = null;
@@ -2208,24 +2308,32 @@ function updateBallReturn(dt) {
   if (ballReturn.holdForRunner) {
     if (runner.active) return;
     ballReturn.holdForRunner = false;
+    // Runner's done — start the windup now and hold the ball the release-lead
+    // so it leaves at the top of the overhand arc (the pause expiry launches).
     if (ballReturn.thrower) {
       triggerDollAction(ballReturn.thrower.rec, 'throw');
-      launchThrowFrom(ballReturn.thrower.rec); // the ball reappears out of his throwing hand
+      ballReturn.pause = Math.max(ballReturn.pause, THROW_RELEASE_TIME);
     }
-    ballReturn.thrower = null; // released — the throw is away
   }
   // Whoever has the ball holds it (and his spot) a beat before throwing on.
   if (ballReturn.pause > 0) {
     ballReturn.pause -= dt;
+    const holder = ballReturn.thrower || ballReturn.relayFielder;
+    // Start the windup with a release-lead left on the clock, so the arm is
+    // at the top of its overhand arc the moment the pause expires and the
+    // ball leaves the hand.
+    if (ballReturn.pause > 0 && ballReturn.pause <= THROW_RELEASE_TIME &&
+        holder && holder.rec && holder.rec.action !== 'throw') {
+      triggerDollAction(holder.rec, 'throw');
+    }
     if (ballReturn.pause <= 0) {
-      // Throw is away — animate whoever was holding it (the initial thrower, or
-      // the cutoff man relaying it on), then free him to jog home.
-      const holder = ballReturn.thrower || ballReturn.relayFielder;
+      // Throw is away — out of the throwing hand of whoever was holding it
+      // (the initial thrower, or the cutoff man relaying it on).
       if (holder && holder.rec) {
-        triggerDollAction(holder.rec, 'throw');
-        launchThrowFrom(holder.rec); // out of the throwing hand, not the mitt
+        if (holder.rec.action !== 'throw') triggerDollAction(holder.rec, 'throw');
+        launchThrowFrom(holder.rec);
       }
-      ballReturn.thrower = null;
+      ballReturn.thrower = null; // released — free to jog home
     }
     return;
   }
@@ -2319,8 +2427,14 @@ function updateThrowToFirst(dt) {
   else fielderByPos('1B').rec.reach = gloveReachSide(fielderByPos('1B').rec);
   if (throwToFirst.delay > 0) { // gathering: the ball's in his mitt
     throwToFirst.delay -= dt;
+    // Windup starts a release-lead before the gather expires, so the arm hits
+    // the top of the overhand arc exactly as the ball leaves.
+    if (throwToFirst.delay > 0 && throwToFirst.delay <= THROW_RELEASE_TIME &&
+        throwToFirst.thrower.rec.action !== 'throw') {
+      triggerDollAction(throwToFirst.thrower.rec, 'throw');
+    }
     if (throwToFirst.delay > 0) return;
-    triggerDollAction(throwToFirst.thrower.rec, 'throw');
+    if (throwToFirst.thrower.rec.action !== 'throw') triggerDollAction(throwToFirst.thrower.rec, 'throw');
     launchThrowFrom(throwToFirst.thrower.rec); // the ball reappears out of his throwing hand
   }
   releaseBallFromGlove(); // the throw is in flight — ball out of the mitt and back in sight
@@ -2528,8 +2642,14 @@ function updateGroundPlay(dt) {
   if (currentHop) currentHop.cover.rec.reach = gloveReachSide(currentHop.cover.rec);
   if (groundPlay.delay > 0) { // gathering: the ball's in the fielder's mitt
     groundPlay.delay -= dt;
+    // Windup starts a release-lead before the gather expires, so the arm hits
+    // the top of the overhand arc exactly as the ball leaves.
+    if (groundPlay.delay > 0 && groundPlay.delay <= THROW_RELEASE_TIME &&
+        groundPlay.thrower.rec.action !== 'throw') {
+      triggerDollAction(groundPlay.thrower.rec, 'throw');
+    }
     if (groundPlay.delay > 0) return;
-    triggerDollAction(groundPlay.thrower.rec, 'throw');
+    if (groundPlay.thrower.rec.action !== 'throw') triggerDollAction(groundPlay.thrower.rec, 'throw');
     launchThrowFrom(groundPlay.thrower.rec); // the ball reappears out of his throwing hand
   }
   const hop = groundPlay.hops[groundPlay.index];
@@ -2537,10 +2657,15 @@ function updateGroundPlay(dt) {
   if (groundPlay.pauseLeft > 0) {
     // Ball held in the pivot man's mitt (the glove system pins and hides it).
     groundPlay.pauseLeft -= dt;
+    // Pivot man's windup leads his relay the same way.
+    if (groundPlay.pauseLeft > 0 && groundPlay.pauseLeft <= THROW_RELEASE_TIME &&
+        hop.cover.rec.action !== 'throw') {
+      triggerDollAction(hop.cover.rec, 'throw');
+    }
     if (groundPlay.pauseLeft <= 0) {
       groundPlay.index++;
       groundPlay.speed = throwingRatingToThrowSpeed(hop.cover.attrs.throwing); // pivot man's relay
-      triggerDollAction(hop.cover.rec, 'throw'); // the pivot fires it on
+      if (hop.cover.rec.action !== 'throw') triggerDollAction(hop.cover.rec, 'throw'); // the pivot fires it on
       launchThrowFrom(hop.cover.rec); // out of his throwing hand, not the mitt
     }
     return;
@@ -3283,9 +3408,12 @@ function animate() {
         // leaving it sitting wherever the pitch happened to arrive (which reads
         // as the ball floating inside his body) — it tucks out of sight the
         // instant the beat ends and reappears out of his throwing hand when
-        // startCatcherReturn fires, in lockstep.
-        showBallInGlove(fielderByPos('C').rec, 0.3);
-        setTimeout(startCatcherReturn, 300); // brief beat before the catcher throws it back
+        // startCatcherReturn fires, in lockstep. The throw windup starts NOW
+        // so the arm is at the top of its overhand arc when the ball leaves
+        // (the beat below matches THROW_RELEASE_TIME).
+        showBallInGlove(fielderByPos('C').rec, THROW_RELEASE_TIME);
+        triggerDollAction(fielderByPos('C').rec, 'throw');
+        setTimeout(startCatcherReturn, THROW_RELEASE_TIME * 1000); // windup plays through the beat
       } else {
         pitch.resetting = false; // strikeout ended the inning — the teams are swapping
       }
