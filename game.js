@@ -1092,6 +1092,7 @@ const HIT_RADIUS = 1.6; // how close the ball needs to be to the bat's sweet spo
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Enter') {
     e.preventDefault();
+    if (subMenuState.open) return; // menu owns the keyboard while it's up
     if (!swing.active) {
       swing.active = true;
       swing.t = 0;
@@ -2105,7 +2106,19 @@ function segmentIntersect2D(p1, p2, p3, p4) {
 
 function showPitchCall(message) {
   const el = document.getElementById('pitchCallText');
+  el.classList.remove('sub-call');
   el.textContent = message;
+  el.classList.remove('show');
+  void el.offsetWidth; // restart animation
+  el.classList.add('show');
+}
+
+// Same banner, sized down and slowed down for the longer player-name text of
+// a substitution announcement (title line + "X in for Y" detail line).
+function showSubCall(title, detail) {
+  const el = document.getElementById('pitchCallText');
+  el.classList.add('sub-call');
+  el.innerHTML = `<span class="sub-call-title">${title}</span>${detail}`;
   el.classList.remove('show');
   void el.offsetWidth; // restart animation
   el.classList.add('show');
@@ -3273,9 +3286,163 @@ function launchPitch() {
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') {
     e.preventDefault();
+    if (subMenuState.open) return; // menu owns the keyboard while it's up
     throwPitch();
   }
 });
+
+// ---------- Substitution menu (Escape): swap a position player for a bench player, ----------
+// ---------- or the pitcher for a bullpen arm. Removed players are done for the game. ----------
+// The incoming player takes the outgoing player's roster slot, so he inherits the
+// lineup spot and the fielding position; the outgoing player goes nowhere (he can't
+// reenter) and the replacement leaves his bench/bullpen pool for good.
+const subMenuEl = document.getElementById('subMenu');
+const subMenuState = { open: false, teamKey: 'visitor', outIdx: null, inIdx: null, notice: '', pendingCalls: [] };
+
+// Subs only happen with a dead ball — mid-play or mid-inning-swap the field is
+// in motion and half the game state is tied to specific players.
+function canOpenSubMenu() {
+  return !pitch.inFlight && !inPlay.active && !runner.active &&
+         inningTransition.phase === 'none' && !gameEnded;
+}
+
+function openSubMenu() {
+  subMenuState.open = true;
+  subMenuState.outIdx = null;
+  subMenuState.inIdx = null;
+  subMenuState.notice = '';
+  subMenuState.pendingCalls = [];
+  renderSubMenu();
+  subMenuEl.classList.add('open');
+}
+
+const SUB_CALL_DURATION_MS = 3000; // must match the .sub-call show animation's duration
+
+// Fires the queued substitution banners back-to-back once play resumes, so a
+// sub made mid-menu-browsing surprises you on return instead of popping up
+// behind the panel while you're still picking your next move.
+function closeSubMenu() {
+  subMenuState.open = false;
+  subMenuEl.classList.remove('open');
+  subMenuState.pendingCalls.forEach((call, i) => {
+    setTimeout(() => showSubCall(call.title, call.detail), i * (SUB_CALL_DURATION_MS + 300));
+  });
+  subMenuState.pendingCalls = [];
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape') {
+    e.preventDefault();
+    if (subMenuState.open) closeSubMenu();
+    else if (canOpenSubMenu()) openSubMenu();
+  }
+});
+
+// Pitchers can only be replaced from the bullpen; everyone else from the bench.
+function subPoolFor(team, outPlayer) {
+  return outPlayer.pos === 'P' ? team.bullpen : team.substitutes;
+}
+
+function subPlayerLineHTML(p) {
+  return `<span class="sub-pos">${p.pos}</span><span class="sub-name">${p.name}</span>` +
+         `<span class="sub-stats">Spd ${p.speed} · Thr ${p.throwing} · Hit ${p.hitting} · ${p.batHand}/${p.throwHand}</span>`;
+}
+
+function renderSubMenu() {
+  const team = teams[subMenuState.teamKey];
+  const tabs = ['visitor', 'home'].map(k =>
+    `<button class="sub-tab${k === subMenuState.teamKey ? ' active' : ''}" data-team="${k}">${teams[k].name}</button>`
+  ).join('');
+
+  const outPlayer = subMenuState.outIdx != null ? team.roster[subMenuState.outIdx] : null;
+
+  const lineupRows = team.roster.map((p, i) => {
+    const atBat = team === battingTeam() && i === team.battingOrder[team.lineupIndex];
+    const onBase = BASE_ORDER.some(b => gameState.bases[b] === p);
+    const tags = (atBat ? '<span class="sub-tag">AT BAT</span>' : '') +
+                 (onBase ? '<span class="sub-tag">ON BASE</span>' : '');
+    return `<div class="sub-row${i === subMenuState.outIdx ? ' selected' : ''}" data-out="${i}">${subPlayerLineHTML(p)}${tags}</div>`;
+  }).join('');
+
+  let benchTitle = 'Replacements';
+  let benchHTML = `<div class="sub-empty">Select a player to take out of the game.</div>`;
+  if (outPlayer) {
+    const pool = subPoolFor(team, outPlayer);
+    benchTitle = outPlayer.pos === 'P' ? 'Bullpen' : 'Bench';
+    benchHTML = pool.length
+      ? pool.map((p, i) =>
+          `<div class="sub-row${i === subMenuState.inIdx ? ' selected' : ''}" data-in="${i}">${subPlayerLineHTML(p)}</div>`
+        ).join('')
+      : `<div class="sub-empty">${outPlayer.pos === 'P' ? 'The bullpen is empty.' : 'No bench players remain.'}</div>`;
+  }
+
+  const ready = outPlayer && subMenuState.inIdx != null;
+  subMenuEl.innerHTML =
+    `<div class="sub-panel">
+      <div class="sub-title">Substitutions</div>
+      <div class="sub-tabs">${tabs}</div>
+      <div class="sub-columns">
+        <div class="sub-col"><div class="sub-col-title">In the Game</div>${lineupRows}</div>
+        <div class="sub-col"><div class="sub-col-title">${benchTitle}</div>${benchHTML}</div>
+      </div>
+      <div class="sub-footer">
+        <span class="sub-notice">${subMenuState.notice}</span>
+        <button class="sub-confirm" data-confirm ${ready ? '' : 'disabled'}>Confirm Substitution</button>
+        <button class="sub-close" data-close>Resume (Esc)</button>
+      </div>
+    </div>`;
+}
+
+subMenuEl.addEventListener('click', (e) => {
+  const tab = e.target.closest('[data-team]');
+  if (tab) {
+    subMenuState.teamKey = tab.dataset.team;
+    subMenuState.outIdx = null;
+    subMenuState.inIdx = null;
+    renderSubMenu();
+    return;
+  }
+  const outRow = e.target.closest('[data-out]');
+  if (outRow) {
+    subMenuState.outIdx = Number(outRow.dataset.out);
+    subMenuState.inIdx = null; // a new outgoing player may draw from a different pool
+    renderSubMenu();
+    return;
+  }
+  const inRow = e.target.closest('[data-in]');
+  if (inRow) {
+    subMenuState.inIdx = Number(inRow.dataset.in);
+    renderSubMenu();
+    return;
+  }
+  if (e.target.closest('[data-close]')) {
+    closeSubMenu();
+    return;
+  }
+  if (e.target.closest('[data-confirm]') && subMenuState.outIdx != null && subMenuState.inIdx != null) {
+    makeSubstitution(subMenuState.teamKey, subMenuState.outIdx, subMenuState.inIdx);
+  }
+});
+
+function makeSubstitution(teamKey, outIdx, inIdx) {
+  const team = teams[teamKey];
+  const out = team.roster[outIdx];
+  const sub = subPoolFor(team, out).splice(inIdx, 1)[0]; // off the bench for good — no reentry either way
+  sub.pos = out.pos; // he plays wherever the man he replaced was playing
+  team.roster[outIdx] = sub; // same roster slot = same spot in the batting order
+  for (const b of BASE_ORDER) {
+    if (gameState.bases[b] === out) gameState.bases[b] = sub; // pinch runner takes over the base
+  }
+  refreshActivePlayers(); // covers a new pitcher on the mound, a pinch hitter at the plate, or a new fielder
+  subMenuState.outIdx = null;
+  subMenuState.inIdx = null;
+  subMenuState.notice = `${sub.name} in for ${out.name} — ${out.name} is out of the game.`;
+  renderSubMenu();
+  subMenuState.pendingCalls.push({
+    title: out.pos === 'P' ? 'Pitching Change' : 'Substitution',
+    detail: `${sub.name} in for ${out.name}`,
+  });
+}
 
 // ---------- Gameplay camera: batting view behind home plate, switches to a ----------
 // ---------- zoomed-out ball-follow view once the ball is hit into play. ----------
@@ -3371,7 +3538,15 @@ function camStepToward(current, target, alpha, maxStep) {
 const clock = new THREE.Clock();
 
 function animate() {
-  const dt = clock.getDelta();
+  const dt = clock.getDelta(); // called every frame even while paused, so resuming doesn't get one giant dt
+  requestAnimationFrame(animate);
+
+  // Substitution menu up: the sim is frozen (nothing moves, no timers advance),
+  // but the scene keeps rendering behind the dimmer.
+  if (subMenuState.open) {
+    renderer.render(scene, camera);
+    return;
+  }
 
   if (swing.active) {
     swing.t += dt;
@@ -3435,7 +3610,6 @@ function animate() {
   updateCamera(dt);
   updatePlayerBug(); // base occupancy can change from several code paths — cheap enough to just refresh every frame
 
-  requestAnimationFrame(animate);
   renderer.render(scene, camera);
 }
 animate();

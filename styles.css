@@ -27,6 +27,26 @@ html, body { margin:0; padding:0; overflow:hidden; background:#111; }
   70%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
 }
+/* Substitution announcement: names are much longer than "Single!"/"Out!", so
+   it wraps onto two lines at a smaller size and lingers longer to stay readable.
+   It can fire while the sub menu is still open (for a second move), so it floats
+   above the menu's dimmer (z-index 120) instead of behind it. */
+.pitch-call-text.sub-call {
+  font-size: 30px;
+  white-space: normal;
+  max-width: 70vw;
+  text-align: center;
+  line-height: 1.35;
+  z-index: 130;
+}
+.pitch-call-text.sub-call .sub-call-title {
+  display: block;
+  font-size: 1.4em;
+  margin-bottom: 4px;
+}
+.pitch-call-text.sub-call.show {
+  animation: pitchCallFade 3s ease-out forwards;
+}
 
 .homerun-overlay {
   position: fixed;
@@ -150,4 +170,155 @@ html, body { margin:0; padding:0; overflow:hidden; background:#111; }
 .player-bug .player-bug-divider {
   border-top: 1px solid rgba(255, 255, 255, 0.3);
   margin: 6px 0;
+}
+
+/* Substitution menu (Escape): full-screen dimmer with a centered panel.
+   The game sim is frozen while it's open. */
+.sub-menu {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: Arial, sans-serif;
+  z-index: 120;
+}
+.sub-menu.open { display: flex; }
+.sub-panel {
+  background: rgba(15, 20, 15, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 12px;
+  color: #fff;
+  padding: 18px 22px;
+  width: min(880px, 92vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+.sub-title {
+  font-size: 22px;
+  font-weight: 900;
+  text-align: center;
+  margin-bottom: 12px;
+}
+.sub-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.sub-tab {
+  flex: 1;
+  padding: 8px 10px;
+  font: inherit;
+  font-weight: bold;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.sub-tab.active {
+  background: #ffd700;
+  color: #000;
+  border-color: #ffd700;
+}
+.sub-columns {
+  display: flex;
+  gap: 14px;
+  overflow: hidden;
+  min-height: 0;
+}
+.sub-col {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 8px;
+}
+.sub-col-title {
+  font-weight: bold;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.7);
+  margin: 2px 4px 8px;
+}
+.sub-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sub-row:hover { background: rgba(255, 255, 255, 0.1); }
+.sub-row.selected {
+  background: #ffd700;
+  color: #000;
+}
+.sub-row.selected .sub-stats { color: rgba(0, 0, 0, 0.65); }
+.sub-pos {
+  font-weight: bold;
+  width: 26px;
+  flex: none;
+}
+.sub-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sub-stats {
+  margin-left: auto;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.65);
+  flex: none;
+}
+.sub-tag {
+  flex: none;
+  font-size: 10px;
+  font-weight: bold;
+  background: #ff3b30;
+  color: #fff;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.sub-empty {
+  padding: 12px 8px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+}
+.sub-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+.sub-notice {
+  flex: 1;
+  font-size: 13px;
+  color: #ffd700;
+}
+.sub-footer button {
+  font: inherit;
+  font-weight: bold;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.sub-confirm {
+  background: #ffd700;
+  color: #000;
+  border-color: #ffd700;
+}
+.sub-confirm:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.sub-close {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
 }
